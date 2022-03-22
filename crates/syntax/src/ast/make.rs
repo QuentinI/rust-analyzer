@@ -49,7 +49,7 @@ pub mod ext {
     ) -> Option<ast::Expr> {
         let mut iter = parts.into_iter();
         let base = expr_path(ext::ident_path(iter.next()?));
-        let expr = iter.fold(base, |base, s| expr_field(base, s));
+        let expr = iter.fold(base, expr_field);
         Some(expr)
     }
 
@@ -185,7 +185,7 @@ pub(crate) fn generic_arg_list() -> ast::GenericArgList {
 }
 
 pub fn path_segment(name_ref: ast::NameRef) -> ast::PathSegment {
-    ast_from_text(&format!("use {};", name_ref))
+    ast_from_text(&format!("type __ = {};", name_ref))
 }
 
 pub fn path_segment_ty(type_ref: ast::Type, trait_ref: Option<ast::PathType>) -> ast::PathSegment {
@@ -209,7 +209,7 @@ pub fn path_segment_crate() -> ast::PathSegment {
 }
 
 pub fn path_unqualified(segment: ast::PathSegment) -> ast::Path {
-    ast_from_text(&format!("use {}", segment))
+    ast_from_text(&format!("type __ = {};", segment))
 }
 
 pub fn path_qualified(qual: ast::Path, segment: ast::PathSegment) -> ast::Path {
@@ -217,7 +217,7 @@ pub fn path_qualified(qual: ast::Path, segment: ast::PathSegment) -> ast::Path {
 }
 // FIXME: path concatenation operation doesn't make sense as AST op.
 pub fn path_concat(first: ast::Path, second: ast::Path) -> ast::Path {
-    ast_from_text(&format!("{}::{}", first, second))
+    ast_from_text(&format!("type __ = {}::{};", first, second))
 }
 
 pub fn path_from_segments(
@@ -234,7 +234,7 @@ pub fn path_from_segments(
 
 pub fn join_paths(paths: impl IntoIterator<Item = ast::Path>) -> ast::Path {
     let paths = paths.into_iter().map(|it| it.syntax().clone()).join("::");
-    ast_from_text(&format!("use {};", paths))
+    ast_from_text(&format!("type __ = {};", paths))
 }
 
 // FIXME: should not be pub
@@ -368,18 +368,28 @@ pub fn expr_empty_block() -> ast::Expr {
 pub fn expr_path(path: ast::Path) -> ast::Expr {
     expr_from_text(&path.to_string())
 }
-pub fn expr_continue() -> ast::Expr {
-    expr_from_text("continue")
+pub fn expr_continue(label: Option<ast::Lifetime>) -> ast::Expr {
+    match label {
+        Some(label) => expr_from_text(&format!("continue {}", label)),
+        None => expr_from_text("continue"),
+    }
 }
 // Consider `op: SyntaxKind` instead for nicer syntax at the call-site?
 pub fn expr_bin_op(lhs: ast::Expr, op: ast::BinaryOp, rhs: ast::Expr) -> ast::Expr {
     expr_from_text(&format!("{} {} {}", lhs, op, rhs))
 }
-pub fn expr_break(expr: Option<ast::Expr>) -> ast::Expr {
-    match expr {
-        Some(expr) => expr_from_text(&format!("break {}", expr)),
-        None => expr_from_text("break"),
+pub fn expr_break(label: Option<ast::Lifetime>, expr: Option<ast::Expr>) -> ast::Expr {
+    let mut s = String::from("break");
+
+    if let Some(label) = label {
+        format_to!(s, " {}", label);
     }
+
+    if let Some(expr) = expr {
+        format_to!(s, " {}", expr);
+    }
+
+    expr_from_text(&s)
 }
 pub fn expr_return(expr: Option<ast::Expr>) -> ast::Expr {
     match expr {
@@ -397,7 +407,7 @@ pub fn expr_match(expr: ast::Expr, match_arm_list: ast::MatchArmList) -> ast::Ex
     expr_from_text(&format!("match {} {}", expr, match_arm_list))
 }
 pub fn expr_if(
-    condition: ast::Condition,
+    condition: ast::Expr,
     then_branch: ast::BlockExpr,
     else_branch: Option<ast::ElseBranch>,
 ) -> ast::Expr {
@@ -456,14 +466,8 @@ pub fn expr_assignment(lhs: ast::Expr, rhs: ast::Expr) -> ast::Expr {
 fn expr_from_text(text: &str) -> ast::Expr {
     ast_from_text(&format!("const C: () = {};", text))
 }
-
-pub fn condition(expr: ast::Expr, pattern: Option<ast::Pat>) -> ast::Condition {
-    match pattern {
-        None => ast_from_text(&format!("const _: () = while {} {{}};", expr)),
-        Some(pattern) => {
-            ast_from_text(&format!("const _: () = while let {} = {} {{}};", pattern, expr))
-        }
-    }
+pub fn expr_let(pattern: ast::Pat, expr: ast::Expr) -> ast::LetExpr {
+    ast_from_text(&format!("const _: () = while let {} = {} {{}};", pattern, expr))
 }
 
 pub fn arg_list(args: impl IntoIterator<Item = ast::Expr>) -> ast::ArgList {
@@ -788,6 +792,7 @@ pub fn struct_(
     ))
 }
 
+#[track_caller]
 fn ast_from_text<N: AstNode>(text: &str) -> N {
     let parse = SourceFile::parse(text);
     let node = match parse.tree().syntax().descendants().find_map(N::cast) {

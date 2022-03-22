@@ -102,7 +102,7 @@ use std::ops::Deref;
 // }
 // ----
 
-use ide_db::helpers::{import_assets::LocatedImport, insert_use::ImportScope};
+use ide_db::imports::{import_assets::LocatedImport, insert_use::ImportScope};
 use itertools::Itertools;
 use syntax::{ast, AstNode, GreenNode, SyntaxNode};
 
@@ -181,7 +181,6 @@ fn import_edits(
     let resolve = |import: &GreenNode| {
         let path = ast::Path::cast(SyntaxNode::new_root(import.clone()))?;
         let item = match ctx.scope.speculative_resolve(&path)? {
-            hir::PathResolution::Macro(mac) => mac.into(),
             hir::PathResolution::Def(def) => def.into(),
             _ => return None,
         };

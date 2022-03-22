@@ -1,6 +1,6 @@
 //! Defines hir-level representation of visibility (e.g. `pub` and `pub(crate)`).
 
-use std::sync::Arc;
+use std::{iter, sync::Arc};
 
 use hir_expand::{hygiene::Hygiene, InFile};
 use la_arena::ArenaMap;
@@ -11,7 +11,7 @@ use crate::{
     nameres::DefMap,
     path::{ModPath, PathKind},
     resolver::HasResolver,
-    FunctionId, HasModule, LocalFieldId, ModuleId, VariantId,
+    ConstId, FunctionId, HasModule, LocalFieldId, ModuleId, VariantId,
 };
 
 /// Visibility of an item, not yet resolved.
@@ -25,7 +25,7 @@ pub enum RawVisibility {
 }
 
 impl RawVisibility {
-    pub(crate) fn private() -> RawVisibility {
+    pub(crate) const fn private() -> RawVisibility {
         RawVisibility::Module(ModPath::from_kind(PathKind::Super(0)))
     }
 
@@ -113,10 +113,7 @@ impl Visibility {
     }
 
     pub(crate) fn is_visible_from_other_crate(self) -> bool {
-        match self {
-            Visibility::Module(_) => false,
-            Visibility::Public => true,
-        }
+        matches!(self, Visibility::Public)
     }
 
     pub(crate) fn is_visible_from_def_map(
@@ -145,10 +142,7 @@ impl Visibility {
                 arc = to_module.def_map(db);
                 &arc
             };
-        let is_block_root = match to_module.block {
-            Some(_) => to_module_def_map[to_module.local_id].parent.is_none(),
-            None => false,
-        };
+        let is_block_root = matches!(to_module.block, Some(_) if to_module_def_map[to_module.local_id].parent.is_none());
         if is_block_root {
             to_module = to_module_def_map.containing_module(to_module.local_id).unwrap();
         }
@@ -161,9 +155,7 @@ impl Visibility {
                 return true;
             }
             match def_map[from_module].parent {
-                Some(parent) => {
-                    from_module = parent;
-                }
+                Some(parent) => from_module = parent,
                 None => {
                     match def_map.parent() {
                         Some(module) => {
@@ -171,10 +163,8 @@ impl Visibility {
                             def_map = &*parent_arc;
                             from_module = module.local_id;
                         }
-                        None => {
-                            // Reached the root module, nothing left to check.
-                            return false;
-                        }
+                        // Reached the root module, nothing left to check.
+                        None => return false,
                     }
                 }
             }
@@ -194,12 +184,12 @@ impl Visibility {
                     return None;
                 }
 
-                let mut a_ancestors = std::iter::successors(Some(mod_a.local_id), |m| {
-                    let parent_id = def_map[*m].parent?;
+                let mut a_ancestors = iter::successors(Some(mod_a.local_id), |&m| {
+                    let parent_id = def_map[m].parent?;
                     Some(parent_id)
                 });
-                let mut b_ancestors = std::iter::successors(Some(mod_b.local_id), |m| {
-                    let parent_id = def_map[*m].parent?;
+                let mut b_ancestors = iter::successors(Some(mod_b.local_id), |&m| {
+                    let parent_id = def_map[m].parent?;
                     Some(parent_id)
                 });
 
@@ -243,4 +233,10 @@ pub(crate) fn field_visibilities_query(
 pub(crate) fn function_visibility_query(db: &dyn DefDatabase, def: FunctionId) -> Visibility {
     let resolver = def.resolver(db);
     db.function_data(def).visibility.resolve(db, &resolver)
+}
+
+/// Resolve visibility of a const.
+pub(crate) fn const_visibility_query(db: &dyn DefDatabase, def: ConstId) -> Visibility {
+    let resolver = def.resolver(db);
+    db.const_data(def).visibility.resolve(db, &resolver)
 }

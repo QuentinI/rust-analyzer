@@ -15,6 +15,7 @@ fn check_hover_no_result(ra_fixture: &str) {
     assert!(hover.is_none(), "hover not expected but found: {:?}", hover.unwrap());
 }
 
+#[track_caller]
 fn check(ra_fixture: &str, expect: Expect) {
     let (analysis, position) = fixture::position(ra_fixture);
     let hover = analysis
@@ -1311,6 +1312,60 @@ fn test_hover_function_show_qualifiers() {
 }
 
 #[test]
+fn test_hover_function_show_types() {
+    check(
+        r#"fn foo$0(a: i32, b:i32) -> i32 { 0 }"#,
+        expect![[r#"
+                *foo*
+
+                ```rust
+                test
+                ```
+
+                ```rust
+                fn foo(a: i32, b: i32) -> i32
+                ```
+            "#]],
+    );
+}
+
+#[test]
+fn test_hover_function_pointer_show_identifiers() {
+    check(
+        r#"type foo$0 = fn(a: i32, b: i32) -> i32;"#,
+        expect![[r#"
+                *foo*
+
+                ```rust
+                test
+                ```
+
+                ```rust
+                type foo = fn(a: i32, b: i32) -> i32
+                ```
+            "#]],
+    );
+}
+
+#[test]
+fn test_hover_function_pointer_no_identifier() {
+    check(
+        r#"type foo$0 = fn(i32, _: i32) -> i32;"#,
+        expect![[r#"
+                *foo*
+
+                ```rust
+                test
+                ```
+
+                ```rust
+                type foo = fn(i32, i32) -> i32
+                ```
+            "#]],
+    );
+}
+
+#[test]
 fn test_hover_trait_show_qualifiers() {
     check_actions(
         r"unsafe trait foo$0() {}",
@@ -1699,6 +1754,30 @@ fn foo() { let bar = Bar; bar.fo$0o(); }
 
                 Do the foo
             "#]],
+    );
+}
+
+#[test]
+fn test_hover_variadic_function() {
+    check(
+        r#"
+extern "C" {
+    pub fn foo(bar: i32, ...) -> i32;
+}
+
+fn main() { let foo_test = unsafe { fo$0o(1, 2, 3); } }
+"#,
+        expect![[r#"
+            *foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            pub unsafe fn foo(bar: i32, ...) -> i32
+            ```
+        "#]],
     );
 }
 
@@ -2859,6 +2938,27 @@ fn main() {
 }
 
 #[test]
+fn const_generic_order() {
+    check(
+        r#"
+struct Foo;
+struct S$0T<const C: usize = 1, T = Foo>(T);
+"#,
+        expect![[r#"
+            *ST*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            struct ST<const C: usize, T = Foo>
+            ```
+        "#]],
+    );
+}
+
+#[test]
 fn hover_self_param_shows_type() {
     check(
         r#"
@@ -3262,6 +3362,27 @@ fn foo<T$0: Sized + ?Sized + Sized + Trait>() {}
 }
 
 #[test]
+fn hover_const_generic_type_alias() {
+    check(
+        r#"
+struct Foo<const LEN: usize>;
+type Fo$0o2 = Foo<2>;
+"#,
+        expect![[r#"
+                *Foo2*
+
+                ```rust
+                test
+                ```
+
+                ```rust
+                type Foo2 = Foo<2>
+                ```
+            "#]],
+    );
+}
+
+#[test]
 fn hover_const_param() {
     check(
         r#"
@@ -3428,6 +3549,27 @@ const FOO$0: usize = 1 << 100;
 
             ```rust
             const FOO: usize = 1 << 100
+            ```
+
+            ---
+
+            This is a doc
+        "#]],
+    );
+    check(
+        r#"
+/// This is a doc
+const FOO$0: &str = "bar";
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: &str = "bar"
             ```
 
             ---
@@ -3981,16 +4123,16 @@ identity!{
 }
 "#,
         expect![[r#"
-                *Copy*
+            *Copy*
 
-                ```rust
-                test
-                ```
+            ```rust
+            test
+            ```
 
-                ```rust
-                pub macro Copy
-                ```
-            "#]],
+            ```rust
+            macro Copy
+            ```
+        "#]],
     );
 }
 
@@ -4005,16 +4147,16 @@ pub macro Copy {}
 struct Foo;
 "#,
         expect![[r#"
-                *Copy*
+            *Copy*
 
-                ```rust
-                test
-                ```
+            ```rust
+            test
+            ```
 
-                ```rust
-                pub macro Copy
-                ```
-            "#]],
+            ```rust
+            macro Copy
+            ```
+        "#]],
     );
     check(
         r#"
@@ -4027,16 +4169,16 @@ mod foo {
 struct Foo;
 "#,
         expect![[r#"
-                *Copy*
+            *Copy*
 
-                ```rust
-                test
-                ```
+            ```rust
+            test::foo
+            ```
 
-                ```rust
-                pub macro Copy
-                ```
-            "#]],
+            ```rust
+            macro Copy
+            ```
+        "#]],
     );
 }
 
@@ -4526,5 +4668,35 @@ pub struct Foo;
 
             * \#\[allow(lint1, lint2, ..., /\*opt\*/ reason = "...")\]
         "##]],
+    );
+}
+
+#[test]
+fn hover_dollar_crate() {
+    // $crate should be resolved to the right crate name.
+
+    check(
+        r#"
+//- /main.rs crate:main deps:dep
+dep::m!(KONST$0);
+//- /dep.rs crate:dep
+#[macro_export]
+macro_rules! m {
+    ( $name:ident ) => { const $name: $crate::Type = $crate::Type; };
+}
+
+pub struct Type;
+"#,
+        expect![[r#"
+            *KONST*
+
+            ```rust
+            main
+            ```
+
+            ```rust
+            const KONST: dep::Type = $crate::Type
+            ```
+        "#]],
     );
 }

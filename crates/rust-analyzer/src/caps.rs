@@ -34,7 +34,7 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
             work_done_progress_options: WorkDoneProgressOptions { work_done_progress: None },
         }),
         signature_help_provider: Some(SignatureHelpOptions {
-            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string(), "<".to_string()]),
             retrigger_characters: None,
             work_done_progress_options: WorkDoneProgressOptions { work_done_progress: None },
         }),
@@ -113,15 +113,19 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
         ),
         moniker_provider: None,
         experimental: Some(json!({
-            "joinLines": true,
-            "openCargoToml": true,
-            "ssr": true,
-            "onEnter": true,
-            "parentModule": true,
+            "externalDocs": true,
             "hoverRange": true,
+            "inlayHints": true,
+            "joinLines": true,
+            "matchingBrace": true,
+            "moveItem": true,
+            "onEnter": true,
+            "openCargoToml": true,
+            "parentModule": true,
             "runnables": {
                 "kinds": [ "cargo" ],
             },
+            "ssr": true,
             "workspaceSymbolScopeKindFiltering": true,
         })),
     }

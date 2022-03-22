@@ -1,6 +1,6 @@
 use expect_test::expect;
 
-use super::{check_infer, check_types};
+use super::{check_infer, check_no_mismatches, check_types};
 
 #[test]
 fn infer_box() {
@@ -1202,14 +1202,13 @@ fn infer_array() {
 
             let b = [a, ["b"]];
             let x: [u8; 0] = [];
-            // FIXME: requires const evaluation/taking type from rhs somehow
             let y: [u8; 2+2] = [1,2,3,4];
         }
         "#,
         expect![[r#"
             8..9 'x': &str
             17..18 'y': isize
-            27..395 '{     ...,4]; }': ()
+            27..326 '{     ...,4]; }': ()
             37..38 'a': [&str; 1]
             41..44 '[x]': [&str; 1]
             42..43 'x': &str
@@ -1259,12 +1258,12 @@ fn infer_array() {
             259..262 '"b"': &str
             274..275 'x': [u8; 0]
             287..289 '[]': [u8; 0]
-            368..369 'y': [u8; _]
-            383..392 '[1,2,3,4]': [u8; 4]
-            384..385 '1': u8
-            386..387 '2': u8
-            388..389 '3': u8
-            390..391 '4': u8
+            299..300 'y': [u8; 4]
+            314..323 '[1,2,3,4]': [u8; 4]
+            315..316 '1': u8
+            317..318 '2': u8
+            319..320 '3': u8
+            321..322 '4': u8
         "#]],
     );
 }
@@ -2248,6 +2247,7 @@ fn generic_default_in_struct_literal() {
             176..193 'Thing ...1i32 }': Thing<i32>
             187..191 '1i32': i32
             199..240 'if let...     }': ()
+            202..221 'let Th... } = z': bool
             206..217 'Thing { t }': Thing<i32>
             214..215 't': i32
             220..221 'z': Thing<i32>
@@ -2620,6 +2620,24 @@ pub mod prelude {
     pub mod rust_2015 {
         pub struct Rust;
     }
+}
+    "#,
+    );
+}
+
+#[test]
+fn legacy_const_generics() {
+    check_no_mismatches(
+        r#"
+#[rustc_legacy_const_generics(1, 3)]
+fn mixed<const N1: &'static str, const N2: bool>(
+    a: u8,
+    b: i8,
+) {}
+
+fn f() {
+    mixed(0, "", -1, true);
+    mixed::<"", true>(0, -1);
 }
     "#,
     );

@@ -230,7 +230,7 @@ fn opt_item_without_modifiers(p: &mut Parser, m: Marker) -> Result<(), Marker> {
         IDENT if p.at_contextual_kw(T![macro_rules]) && p.nth(1) == BANG => macro_rules(p, m),
 
         T![const] if (la == IDENT || la == T![_] || la == T![mut]) => consts::konst(p, m),
-        T![static] => consts::static_(p, m),
+        T![static] if (la == IDENT || la == T![_] || la == T![mut]) => consts::static_(p, m),
 
         _ => return Err(m),
     };
@@ -290,12 +290,17 @@ fn type_alias(p: &mut Parser, m: Marker) {
         generic_params::bounds(p);
     }
 
-    // test type_item_where_clause
+    // test type_item_where_clause_deprecated
     // type Foo where Foo: Copy = ();
     generic_params::opt_where_clause(p);
     if p.eat(T![=]) {
         types::type_(p);
     }
+
+    // test type_item_where_clause
+    // type Foo = () where Foo: Copy;
+    generic_params::opt_where_clause(p);
+
     p.expect(T![;]);
     m.complete(p, TYPE_ALIAS);
 }

@@ -8,22 +8,25 @@ use chalk_ir::{fold::Shift, BoundVar, DebruijnIndex};
 use hir_def::{
     db::DefDatabase,
     generics::{
-        GenericParams, TypeParamData, TypeParamProvenance, WherePredicate, WherePredicateTypeTarget,
+        GenericParams, TypeOrConstParamData, TypeParamData, TypeParamProvenance, WherePredicate,
+        WherePredicateTypeTarget,
     },
     intern::Interned,
     path::Path,
     resolver::{HasResolver, TypeNs},
     type_ref::{TraitBoundModifier, TypeRef},
-    GenericDefId, ItemContainerId, Lookup, TraitId, TypeAliasId, TypeParamId,
+    ConstParamId, GenericDefId, ItemContainerId, Lookup, TraitId, TypeAliasId, TypeOrConstParamId,
+    TypeParamId,
 };
 use hir_expand::name::{name, Name};
+use itertools::Either;
 use rustc_hash::FxHashSet;
 use smallvec::{smallvec, SmallVec};
 use syntax::SmolStr;
 
 use crate::{
-    db::HirDatabase, ChalkTraitId, Interner, Substitution, TraitRef, TraitRefExt, TyKind,
-    WhereClause,
+    db::HirDatabase, ChalkTraitId, ConstData, ConstValue, GenericArgData, Interner, Substitution,
+    TraitRef, TraitRefExt, TyKind, WhereClause,
 };
 
 pub(crate) fn fn_traits(db: &dyn DefDatabase, krate: CrateId) -> impl Iterator<Item = TraitId> {
@@ -55,7 +58,9 @@ fn direct_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> SmallVec<[Trait
                     TypeRef::Path(p) if p == &Path::from(name![Self]) => bound.as_path(),
                     _ => None,
                 },
-                WherePredicateTypeTarget::TypeParam(local_id) if Some(*local_id) == trait_self => {
+                WherePredicateTypeTarget::TypeOrConstParam(local_id)
+                    if Some(*local_id) == trait_self =>
+                {
                     bound.as_path()
                 }
                 _ => None,
@@ -80,7 +85,7 @@ fn direct_super_trait_refs(db: &dyn HirDatabase, trait_ref: &TraitRef) -> Vec<Tr
     // SmallVec if performance is a concern)
     let generic_params = db.generic_params(trait_ref.hir_trait_id().into());
     let trait_self = match generic_params.find_trait_self_param() {
-        Some(p) => TypeParamId { parent: trait_ref.hir_trait_id().into(), local_id: p },
+        Some(p) => TypeOrConstParamId { parent: trait_ref.hir_trait_id().into(), local_id: p },
         None => return Vec::new(),
     };
     db.generic_predicates_for_param(trait_self.parent, trait_self, None)
@@ -181,34 +186,64 @@ pub(crate) struct Generics {
 }
 
 impl Generics {
-    pub(crate) fn iter<'a>(
+    // FIXME: we should drop this and handle const and type generics at the same time
+    pub(crate) fn type_iter<'a>(
         &'a self,
-    ) -> impl Iterator<Item = (TypeParamId, &'a TypeParamData)> + 'a {
+    ) -> impl Iterator<Item = (TypeOrConstParamId, &'a TypeParamData)> + 'a {
         self.parent_generics
             .as_ref()
             .into_iter()
             .flat_map(|it| {
                 it.params
-                    .types
-                    .iter()
-                    .map(move |(local_id, p)| (TypeParamId { parent: it.def, local_id }, p))
+                    .type_iter()
+                    .map(move |(local_id, p)| (TypeOrConstParamId { parent: it.def, local_id }, p))
             })
             .chain(
-                self.params
-                    .types
-                    .iter()
-                    .map(move |(local_id, p)| (TypeParamId { parent: self.def, local_id }, p)),
+                self.params.type_iter().map(move |(local_id, p)| {
+                    (TypeOrConstParamId { parent: self.def, local_id }, p)
+                }),
             )
     }
 
+    pub(crate) fn iter_id<'a>(
+        &'a self,
+    ) -> impl Iterator<Item = Either<TypeParamId, ConstParamId>> + 'a {
+        self.iter().map(|(id, data)| match data {
+            TypeOrConstParamData::TypeParamData(_) => Either::Left(TypeParamId::from_unchecked(id)),
+            TypeOrConstParamData::ConstParamData(_) => {
+                Either::Right(ConstParamId::from_unchecked(id))
+            }
+        })
+    }
+
+    /// Iterator over types and const params of parent, then self.
+    pub(crate) fn iter<'a>(
+        &'a self,
+    ) -> impl DoubleEndedIterator<Item = (TypeOrConstParamId, &'a TypeOrConstParamData)> + 'a {
+        self.parent_generics
+            .as_ref()
+            .into_iter()
+            .flat_map(|it| {
+                it.params
+                    .iter()
+                    .map(move |(local_id, p)| (TypeOrConstParamId { parent: it.def, local_id }, p))
+            })
+            .chain(
+                self.params.iter().map(move |(local_id, p)| {
+                    (TypeOrConstParamId { parent: self.def, local_id }, p)
+                }),
+            )
+    }
+
+    /// Iterator over types and const params of parent.
     pub(crate) fn iter_parent<'a>(
         &'a self,
-    ) -> impl Iterator<Item = (TypeParamId, &'a TypeParamData)> + 'a {
+    ) -> impl Iterator<Item = (TypeOrConstParamId, &'a TypeOrConstParamData)> + 'a {
         self.parent_generics.as_ref().into_iter().flat_map(|it| {
             it.params
-                .types
+                .type_or_consts
                 .iter()
-                .map(move |(local_id, p)| (TypeParamId { parent: it.def, local_id }, p))
+                .map(move |(local_id, p)| (TypeOrConstParamId { parent: it.def, local_id }, p))
         })
     }
 
@@ -219,43 +254,45 @@ impl Generics {
     /// (total, parents, child)
     pub(crate) fn len_split(&self) -> (usize, usize, usize) {
         let parent = self.parent_generics.as_ref().map_or(0, |p| p.len());
-        let child = self.params.types.len();
+        let child = self.params.type_or_consts.len();
         (parent + child, parent, child)
     }
 
-    /// (parent total, self param, type param list, impl trait)
-    pub(crate) fn provenance_split(&self) -> (usize, usize, usize, usize) {
+    /// (parent total, self param, type param list, const param list, impl trait)
+    pub(crate) fn provenance_split(&self) -> (usize, usize, usize, usize, usize) {
         let parent = self.parent_generics.as_ref().map_or(0, |p| p.len());
         let self_params = self
             .params
-            .types
             .iter()
-            .filter(|(_, p)| p.provenance == TypeParamProvenance::TraitSelf)
+            .filter_map(|x| x.1.type_param())
+            .filter(|p| p.provenance == TypeParamProvenance::TraitSelf)
             .count();
-        let list_params = self
+        let type_params = self
             .params
-            .types
+            .type_or_consts
             .iter()
-            .filter(|(_, p)| p.provenance == TypeParamProvenance::TypeParamList)
+            .filter_map(|x| x.1.type_param())
+            .filter(|p| p.provenance == TypeParamProvenance::TypeParamList)
             .count();
+        let const_params = self.params.iter().filter_map(|x| x.1.const_param()).count();
         let impl_trait_params = self
             .params
-            .types
             .iter()
-            .filter(|(_, p)| p.provenance == TypeParamProvenance::ArgumentImplTrait)
+            .filter_map(|x| x.1.type_param())
+            .filter(|p| p.provenance == TypeParamProvenance::ArgumentImplTrait)
             .count();
-        (parent, self_params, list_params, impl_trait_params)
+        (parent, self_params, type_params, const_params, impl_trait_params)
     }
 
-    pub(crate) fn param_idx(&self, param: TypeParamId) -> Option<usize> {
+    pub(crate) fn param_idx(&self, param: TypeOrConstParamId) -> Option<usize> {
         Some(self.find_param(param)?.0)
     }
 
-    fn find_param(&self, param: TypeParamId) -> Option<(usize, &TypeParamData)> {
+    fn find_param(&self, param: TypeOrConstParamId) -> Option<(usize, &TypeOrConstParamData)> {
         if param.parent == self.def {
             let (idx, (_local_id, data)) = self
                 .params
-                .types
+                .type_or_consts
                 .iter()
                 .enumerate()
                 .find(|(_, (idx, _))| *idx == param.local_id)
@@ -268,21 +305,47 @@ impl Generics {
     }
 
     /// Returns a Substitution that replaces each parameter by a bound variable.
-    pub(crate) fn bound_vars_subst(&self, debruijn: DebruijnIndex) -> Substitution {
+    pub(crate) fn bound_vars_subst(
+        &self,
+        db: &dyn HirDatabase,
+        debruijn: DebruijnIndex,
+    ) -> Substitution {
         Substitution::from_iter(
             Interner,
-            self.iter()
-                .enumerate()
-                .map(|(idx, _)| TyKind::BoundVar(BoundVar::new(debruijn, idx)).intern(Interner)),
+            self.iter_id().enumerate().map(|(idx, id)| match id {
+                Either::Left(_) => GenericArgData::Ty(
+                    TyKind::BoundVar(BoundVar::new(debruijn, idx)).intern(Interner),
+                )
+                .intern(Interner),
+                Either::Right(id) => GenericArgData::Const(
+                    ConstData {
+                        value: ConstValue::BoundVar(BoundVar::new(debruijn, idx)),
+                        ty: db.const_param_ty(id),
+                    }
+                    .intern(Interner),
+                )
+                .intern(Interner),
+            }),
         )
     }
 
     /// Returns a Substitution that replaces each parameter by itself (i.e. `Ty::Param`).
-    pub(crate) fn type_params_subst(&self, db: &dyn HirDatabase) -> Substitution {
+    pub(crate) fn placeholder_subst(&self, db: &dyn HirDatabase) -> Substitution {
         Substitution::from_iter(
             Interner,
-            self.iter().map(|(id, _)| {
-                TyKind::Placeholder(crate::to_placeholder_idx(db, id)).intern(Interner)
+            self.iter_id().map(|id| match id {
+                Either::Left(id) => GenericArgData::Ty(
+                    TyKind::Placeholder(crate::to_placeholder_idx(db, id.into())).intern(Interner),
+                )
+                .intern(Interner),
+                Either::Right(id) => GenericArgData::Const(
+                    ConstData {
+                        value: ConstValue::Placeholder(crate::to_placeholder_idx(db, id.into())),
+                        ty: db.const_param_ty(id),
+                    }
+                    .intern(Interner),
+                )
+                .intern(Interner),
             }),
         )
     }

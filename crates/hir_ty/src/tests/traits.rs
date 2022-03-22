@@ -541,6 +541,52 @@ fn test() {
 }
 
 #[test]
+fn infer_ops_index_field() {
+    check_types(
+        r#"
+//- minicore: index
+struct Bar;
+struct Foo {
+    field: u32;
+}
+
+impl core::ops::Index<u32> for Bar {
+    type Output = Foo;
+}
+
+fn test() {
+    let a = Bar;
+    let b = a[1u32].field;
+    b;
+} //^ u32
+"#,
+    );
+}
+
+#[test]
+fn infer_ops_index_field_autoderef() {
+    check_types(
+        r#"
+//- minicore: index
+struct Bar;
+struct Foo {
+    field: u32;
+}
+
+impl core::ops::Index<u32> for Bar {
+    type Output = Foo;
+}
+
+fn test() {
+    let a = Bar;
+    let b = (&a[1u32]).field;
+    b;
+} //^ u32
+"#,
+    );
+}
+
+#[test]
 fn infer_ops_index_int() {
     check_types(
         r#"
@@ -3348,7 +3394,6 @@ fn main() {
     )
 }
 
-// FIXME: We should infer the length of the returned array :)
 #[test]
 fn const_generics() {
     check_infer(
@@ -3372,18 +3417,18 @@ fn main() {
 "#,
         expect![[r#"
             44..48 'self': &Self
-            151..155 'self': &[u8; _]
-            173..194 '{     ...     }': [u8; _]
-            183..188 '*self': [u8; _]
-            184..188 'self': &[u8; _]
+            151..155 'self': &[u8; L]
+            173..194 '{     ...     }': [u8; L]
+            183..188 '*self': [u8; L]
+            184..188 'self': &[u8; L]
             208..260 '{     ...g(); }': ()
             218..219 'v': [u8; 2]
             222..230 '[0u8; 2]': [u8; 2]
             223..226 '0u8': u8
             228..229 '2': usize
-            240..242 'v2': [u8; _]
+            240..242 'v2': [u8; 2]
             245..246 'v': [u8; 2]
-            245..257 'v.do_thing()': [u8; _]
+            245..257 'v.do_thing()': [u8; 2]
         "#]],
     )
 }
@@ -3563,4 +3608,41 @@ fn f<F: Foo>() {
             272..292 'F::Rel..._SIZED': {unknown}
         "#]],
     );
+}
+
+#[test]
+fn dyn_map() {
+    check_types(
+        r#"
+pub struct Key<K, V, P = (K, V)> {}
+
+pub trait Policy {
+    type K;
+    type V;
+}
+
+impl<K, V> Policy for (K, V) {
+    type K = K;
+    type V = V;
+}
+
+pub struct KeyMap<KEY> {}
+
+impl<P: Policy> KeyMap<Key<P::K, P::V, P>> {
+    pub fn get(&self, key: &P::K) -> P::V {
+        loop {}
+    }
+}
+
+struct Fn {}
+struct FunctionId {}
+
+fn test() {
+    let key_map: &KeyMap<Key<Fn, FunctionId>> = loop {};
+    let key;
+    let result = key_map.get(key);
+      //^^^^^^ FunctionId
+}
+"#,
+    )
 }

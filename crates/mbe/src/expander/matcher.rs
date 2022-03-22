@@ -437,11 +437,12 @@ fn match_loop_inner<'t>(
                     let mut new_item = item.clone();
                     new_item.bindings = bindings_builder.copy(&new_item.bindings);
                     new_item.dot.next();
-                    let mut vars = Vec::new();
-                    collect_vars(&mut vars, tokens);
-                    for var in vars {
-                        bindings_builder.push_empty(&mut new_item.bindings, &var);
-                    }
+                    collect_vars(
+                        &mut |s| {
+                            bindings_builder.push_empty(&mut new_item.bindings, &s);
+                        },
+                        tokens,
+                    );
                     cur_items.push(new_item);
                 }
                 cur_items.push(MatchState {
@@ -598,7 +599,7 @@ fn match_loop(pattern: &MetaTemplate, src: &tt::Subtree) -> Match {
                 src = it;
                 res.unmatched_tts += src.len();
             }
-            res.add_err(ExpandError::binding_error("leftover tokens"));
+            res.add_err(ExpandError::LeftoverTokens);
 
             if let Some(error_reover_item) = error_recover_item {
                 res.bindings = bindings_builder.build(&error_reover_item);
@@ -657,7 +658,7 @@ fn match_loop(pattern: &MetaTemplate, src: &tt::Subtree) -> Match {
 fn match_leaf(lhs: &tt::Leaf, src: &mut TtIter) -> Result<(), ExpandError> {
     let rhs = src
         .expect_leaf()
-        .map_err(|()| ExpandError::BindingError(format!("expected leaf: `{lhs}`").into()))?;
+        .map_err(|()| ExpandError::binding_error(format!("expected leaf: `{lhs}`")))?;
     match (lhs, rhs) {
         (
             tt::Leaf::Punct(tt::Punct { char: lhs, .. }),
@@ -689,9 +690,19 @@ fn match_meta_var(kind: &str, input: &mut TtIter) -> ExpandResult<Option<Fragmen
         "item" => parser::PrefixEntryPoint::Item,
         "vis" => parser::PrefixEntryPoint::Vis,
         "expr" => {
+            // `expr` should not match underscores.
+            // HACK: Macro expansion should not be done using "rollback and try another alternative".
+            // rustc [explicitly checks the next token][0].
+            // [0]: https://github.com/rust-lang/rust/blob/f0c4da499/compiler/rustc_expand/src/mbe/macro_parser.rs#L576
+            match input.peek_n(0) {
+                Some(tt::TokenTree::Leaf(tt::Leaf::Ident(it))) if it.text == "_" => {
+                    return ExpandResult::only_err(ExpandError::NoMatchingRule)
+                }
+                _ => {}
+            };
             return input
                 .expect_fragment(parser::PrefixEntryPoint::Expr)
-                .map(|tt| tt.map(Fragment::Expr))
+                .map(|tt| tt.map(Fragment::Expr));
         }
         _ => {
             let tt_result = match kind {
@@ -729,17 +740,16 @@ fn match_meta_var(kind: &str, input: &mut TtIter) -> ExpandResult<Option<Fragmen
     input.expect_fragment(fragment).map(|it| it.map(Fragment::Tokens))
 }
 
-fn collect_vars(buf: &mut Vec<SmolStr>, pattern: &MetaTemplate) {
+fn collect_vars(collector_fun: &mut impl FnMut(SmolStr), pattern: &MetaTemplate) {
     for op in pattern.iter() {
         match op {
-            Op::Var { name, .. } => buf.push(name.clone()),
+            Op::Var { name, .. } => collector_fun(name.clone()),
             Op::Leaf(_) => (),
-            Op::Subtree { tokens, .. } => collect_vars(buf, tokens),
-            Op::Repeat { tokens, .. } => collect_vars(buf, tokens),
+            Op::Subtree { tokens, .. } => collect_vars(collector_fun, tokens),
+            Op::Repeat { tokens, .. } => collect_vars(collector_fun, tokens),
         }
     }
 }
-
 impl MetaTemplate {
     fn iter_delimited<'a>(&'a self, delimited: Option<&'a tt::Delimiter>) -> OpDelimitedIter<'a> {
         OpDelimitedIter { inner: &self.0, idx: 0, delimited }

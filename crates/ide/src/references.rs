@@ -57,8 +57,6 @@ pub(crate) fn find_all_refs(
     let syntax = sema.parse(position.file_id).syntax().clone();
     let make_searcher = |literal_search: bool| {
         move |def: Definition| {
-            let mut usages =
-                def.usages(sema).set_scope(search_scope.clone()).include_self_refs().all();
             let declaration = match def {
                 Definition::Module(module) => {
                     Some(NavigationTarget::from_module_to_decl(sema.db, module))
@@ -72,6 +70,8 @@ pub(crate) fn find_all_refs(
                     nav,
                 }
             });
+            let mut usages =
+                def.usages(sema).set_scope(search_scope.clone()).include_self_refs().all();
             if literal_search {
                 retain_adt_literal_usages(&mut usages, def, sema);
             }
@@ -1501,16 +1501,15 @@ fn f() {
         check(
             r#"
 //- proc_macros: identity
-
 #[proc_macros::identity]
 fn func$0() {
     func();
 }
 "#,
             expect![[r#"
-                func Function FileId(0) 26..51 29..33
+                func Function FileId(0) 25..50 28..32
 
-                FileId(0) 42..46
+                FileId(0) 41..45
             "#]],
         )
     }
@@ -1534,5 +1533,86 @@ trait Trait {
                 FileId(0) 74..78
             "#]],
         )
+    }
+
+    // FIXME: import is classified as function
+    #[test]
+    fn attr() {
+        check(
+            r#"
+//- proc_macros: identity
+use proc_macros::identity;
+
+#[proc_macros::$0identity]
+fn func() {}
+"#,
+            expect![[r#"
+                identity Attribute FileId(1) 1..107 32..40
+
+                FileId(0) 43..51
+            "#]],
+        );
+        check(
+            r#"
+#![crate_type="proc-macro"]
+#[proc_macro_attribute]
+fn func$0() {}
+"#,
+            expect![[r#"
+                func Attribute FileId(0) 28..64 55..59
+
+                (no references)
+            "#]],
+        );
+    }
+
+    // FIXME: import is classified as function
+    #[test]
+    fn proc_macro() {
+        check(
+            r#"
+//- proc_macros: mirror
+use proc_macros::mirror;
+
+mirror$0! {}
+"#,
+            expect![[r#"
+                mirror Macro FileId(1) 1..77 22..28
+
+                FileId(0) 26..32
+            "#]],
+        )
+    }
+
+    #[test]
+    fn derive() {
+        check(
+            r#"
+//- proc_macros: derive_identity
+//- minicore: derive
+use proc_macros::DeriveIdentity;
+
+#[derive(proc_macros::DeriveIdentity$0)]
+struct Foo;
+"#,
+            expect![[r#"
+                derive_identity Derive FileId(2) 1..107 45..60
+
+                FileId(0) 17..31
+                FileId(0) 56..70
+            "#]],
+        );
+        check(
+            r#"
+#![crate_type="proc-macro"]
+#[proc_macro_derive(Derive, attributes(x))]
+pub fn deri$0ve(_stream: TokenStream) -> TokenStream {}
+"#,
+            expect![[r#"
+                derive Derive FileId(0) 28..125 79..85
+
+                (no references)
+            "#]],
+        );
     }
 }

@@ -14,8 +14,8 @@ use crate::{
     item_scope::ItemScope,
     keys,
     src::{HasChildSource, HasSource},
-    AdtId, AssocItemId, DefWithBodyId, EnumId, EnumVariantId, FieldId, ImplId, Lookup, ModuleDefId,
-    ModuleId, TraitId, VariantId,
+    AdtId, AssocItemId, DefWithBodyId, EnumId, EnumVariantId, FieldId, ImplId, Lookup, MacroId,
+    ModuleDefId, ModuleId, TraitId, VariantId,
 };
 
 pub trait ChildBySource {
@@ -97,30 +97,25 @@ impl ChildBySource for ItemScope {
                 res[keys::CONST].insert(loc.source(db).value, konst);
             }
         });
-        self.macros().for_each(|(_, makro)| {
-            let ast_id = makro.ast_id();
-            if ast_id.either(|it| it.file_id, |it| it.file_id) == file_id {
-                let src = match ast_id {
-                    Either::Left(ast_id) => ast_id.to_node(db.upcast()),
-                    // FIXME: Do we need to add proc-macros into a PROCMACRO dynmap here?
-                    Either::Right(_fn) => return,
-                };
-                res[keys::MACRO].insert(src, makro);
-            }
-        });
         self.attr_macro_invocs().filter(|(id, _)| id.file_id == file_id).for_each(
             |(ast_id, call_id)| {
                 res[keys::ATTR_MACRO_CALL].insert(ast_id.to_node(db.upcast()), call_id);
             },
         );
+        self.legacy_macros().for_each(|(_, id)| {
+            let loc = id.lookup(db);
+            if loc.id.file_id() == file_id {
+                res[keys::MACRO_RULES].insert(loc.source(db).value, id);
+            }
+        });
         self.derive_macro_invocs().filter(|(id, _)| id.file_id == file_id).for_each(
             |(ast_id, calls)| {
                 let adt = ast_id.to_node(db.upcast());
-                calls.for_each(|(attr_id, calls)| {
+                calls.for_each(|(attr_id, call_id, calls)| {
                     if let Some(Either::Left(attr)) =
                         adt.doc_comments_and_attrs().nth(attr_id.ast_index as usize)
                     {
-                        res[keys::DERIVE_MACRO_CALL].insert(attr, (attr_id, calls.into()));
+                        res[keys::DERIVE_MACRO_CALL].insert(attr, (attr_id, call_id, calls.into()));
                     }
                 });
             },
@@ -151,7 +146,14 @@ impl ChildBySource for ItemScope {
                     AdtId::UnionId(id) => insert!(map[keys::UNION].insert(id)),
                     AdtId::EnumId(id) => insert!(map[keys::ENUM].insert(id)),
                 },
-                _ => (),
+                ModuleDefId::MacroId(id) => match id {
+                    MacroId::Macro2Id(id) => insert!(map[keys::MACRO2].insert(id)),
+                    MacroId::MacroRulesId(id) => insert!(map[keys::MACRO_RULES].insert(id)),
+                    MacroId::ProcMacroId(id) => insert!(map[keys::PROC_MACRO].insert(id)),
+                },
+                ModuleDefId::ModuleId(_)
+                | ModuleDefId::EnumVariantId(_)
+                | ModuleDefId::BuiltinType(_) => (),
             }
         }
         fn add_impl(db: &dyn DefDatabase, map: &mut DynMap, file_id: HirFileId, imp: ImplId) {

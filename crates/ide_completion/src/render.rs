@@ -3,40 +3,44 @@
 
 pub(crate) mod macro_;
 pub(crate) mod function;
-pub(crate) mod enum_variant;
 pub(crate) mod const_;
 pub(crate) mod pattern;
 pub(crate) mod type_alias;
-pub(crate) mod struct_literal;
-
-mod builder_ext;
+pub(crate) mod variant;
+pub(crate) mod union_literal;
+pub(crate) mod literal;
 
 use hir::{AsAssocItem, HasAttrs, HirDisplay, ScopeDef};
-use ide_db::{
-    helpers::{item_name, SnippetCap},
-    RootDatabase, SymbolKind,
-};
+use ide_db::{helpers::item_name, RootDatabase, SnippetCap, SymbolKind};
 use syntax::{SmolStr, SyntaxKind, TextRange};
 
 use crate::{
     context::{PathCompletionCtx, PathKind},
     item::{CompletionRelevanceTypeMatch, ImportEdit},
-    render::{enum_variant::render_variant, function::render_fn, macro_::render_macro},
+    render::{function::render_fn, literal::render_variant_lit, macro_::render_macro},
     CompletionContext, CompletionItem, CompletionItemKind, CompletionRelevance,
 };
 /// Interface for data and methods required for items rendering.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RenderContext<'a> {
     completion: &'a CompletionContext<'a>,
     is_private_editable: bool,
+    import_to_add: Option<ImportEdit>,
 }
 
 impl<'a> RenderContext<'a> {
-    pub(crate) fn new(
-        completion: &'a CompletionContext<'a>,
-        is_private_editable: bool,
-    ) -> RenderContext<'a> {
-        RenderContext { completion, is_private_editable }
+    pub(crate) fn new(completion: &'a CompletionContext<'a>) -> RenderContext<'a> {
+        RenderContext { completion, is_private_editable: false, import_to_add: None }
+    }
+
+    pub(crate) fn private_editable(mut self, private_editable: bool) -> Self {
+        self.is_private_editable = private_editable;
+        self
+    }
+
+    pub(crate) fn import_to_add(mut self, import_to_add: Option<ImportEdit>) -> Self {
+        self.import_to_add = import_to_add;
+        self
     }
 
     fn snippet_cap(&self) -> Option<SnippetCap> {
@@ -142,6 +146,14 @@ pub(crate) fn render_resolution(
     render_resolution_(ctx, local_name, None, resolution)
 }
 
+pub(crate) fn render_resolution_simple(
+    ctx: RenderContext<'_>,
+    local_name: hir::Name,
+    resolution: ScopeDef,
+) -> CompletionItem {
+    render_resolution_simple_(ctx, local_name, None, resolution)
+}
+
 pub(crate) fn render_resolution_with_import(
     ctx: RenderContext<'_>,
     import_edit: ImportEdit,
@@ -165,29 +177,42 @@ fn render_resolution_(
     let _p = profile::span("render_resolution");
     use hir::ModuleDef::*;
 
-    let db = ctx.db();
-
-    let kind = match resolution {
+    match resolution {
+        ScopeDef::ModuleDef(Macro(mac)) => {
+            let ctx = ctx.import_to_add(import_to_add);
+            return render_macro(ctx, local_name, mac);
+        }
         ScopeDef::ModuleDef(Function(func)) => {
-            return render_fn(ctx, import_to_add, Some(local_name), func);
+            let ctx = ctx.import_to_add(import_to_add);
+            return render_fn(ctx, Some(local_name), func);
         }
         ScopeDef::ModuleDef(Variant(var)) if ctx.completion.pattern_ctx.is_none() => {
-            return render_variant(ctx, import_to_add, Some(local_name), var, None);
-        }
-        ScopeDef::MacroDef(mac) => return render_macro(ctx, import_to_add, local_name, mac),
-        ScopeDef::Unknown => {
-            let mut item = CompletionItem::new(
-                CompletionItemKind::UnresolvedReference,
-                ctx.source_range(),
-                local_name.to_smol_str(),
-            );
-            if let Some(import_to_add) = import_to_add {
-                item.add_import(import_to_add);
+            let ctx = ctx.clone().import_to_add(import_to_add.clone());
+            if let Some(item) = render_variant_lit(ctx, Some(local_name.clone()), var, None) {
+                return item;
             }
-            return item.build();
         }
+        _ => (),
+    }
+    render_resolution_simple_(ctx, local_name, import_to_add, resolution)
+}
 
+fn render_resolution_simple_(
+    ctx: RenderContext<'_>,
+    local_name: hir::Name,
+    import_to_add: Option<ImportEdit>,
+    resolution: ScopeDef,
+) -> CompletionItem {
+    let _p = profile::span("render_resolution");
+    use hir::ModuleDef::*;
+
+    let db = ctx.db();
+    let ctx = ctx.import_to_add(import_to_add);
+    let kind = match resolution {
+        ScopeDef::Unknown => CompletionItemKind::UnresolvedReference,
+        ScopeDef::ModuleDef(Function(_)) => CompletionItemKind::SymbolKind(SymbolKind::Function),
         ScopeDef::ModuleDef(Variant(_)) => CompletionItemKind::SymbolKind(SymbolKind::Variant),
+        ScopeDef::ModuleDef(Macro(_)) => CompletionItemKind::SymbolKind(SymbolKind::Macro),
         ScopeDef::ModuleDef(Module(..)) => CompletionItemKind::SymbolKind(SymbolKind::Module),
         ScopeDef::ModuleDef(Adt(adt)) => CompletionItemKind::SymbolKind(match adt {
             hir::Adt::Struct(_) => SymbolKind::Struct,
@@ -201,8 +226,8 @@ fn render_resolution_(
         ScopeDef::ModuleDef(BuiltinType(..)) => CompletionItemKind::BuiltinType,
         ScopeDef::GenericParam(param) => CompletionItemKind::SymbolKind(match param {
             hir::GenericParam::TypeParam(_) => SymbolKind::TypeParam,
-            hir::GenericParam::LifetimeParam(_) => SymbolKind::LifetimeParam,
             hir::GenericParam::ConstParam(_) => SymbolKind::ConstParam,
+            hir::GenericParam::LifetimeParam(_) => SymbolKind::LifetimeParam,
         }),
         ScopeDef::Local(..) => CompletionItemKind::SymbolKind(SymbolKind::Local),
         ScopeDef::Label(..) => CompletionItemKind::SymbolKind(SymbolKind::Label),
@@ -254,7 +279,7 @@ fn render_resolution_(
     item.set_documentation(scope_def_docs(db, resolution))
         .set_deprecated(scope_def_is_deprecated(&ctx, resolution));
 
-    if let Some(import_to_add) = import_to_add {
+    if let Some(import_to_add) = ctx.import_to_add {
         item.add_import(import_to_add);
     }
     item.build()
@@ -277,7 +302,6 @@ fn scope_def_docs(db: &RootDatabase, resolution: ScopeDef) -> Option<hir::Docume
 fn scope_def_is_deprecated(ctx: &RenderContext<'_>, resolution: ScopeDef) -> bool {
     match resolution {
         ScopeDef::ModuleDef(it) => ctx.is_deprecated_assoc_item(it),
-        ScopeDef::MacroDef(it) => ctx.is_deprecated(it),
         ScopeDef::GenericParam(it) => ctx.is_deprecated(it),
         ScopeDef::AdtSelfType(it) => ctx.is_deprecated(it),
         _ => false,
@@ -430,14 +454,14 @@ fn main() { Foo::Fo$0 }
             expect![[r#"
                 [
                     CompletionItem {
-                        label: "Foo",
+                        label: "Foo {…}",
                         source_range: 54..56,
                         delete: 54..56,
-                        insert: "Foo",
+                        insert: "Foo { x: ${1:()}, y: ${2:()} }$0",
                         kind: SymbolKind(
                             Variant,
                         ),
-                        detail: "{x: i32, y: i32}",
+                        detail: "Foo { x: i32, y: i32 }",
                     },
                 ]
             "#]],
@@ -445,7 +469,7 @@ fn main() { Foo::Fo$0 }
     }
 
     #[test]
-    fn enum_detail_doesnt_include_tuple_fields() {
+    fn enum_detail_includes_tuple_fields() {
         check(
             r#"
 enum Foo { Foo (i32, i32) }
@@ -459,13 +483,11 @@ fn main() { Foo::Fo$0 }
                         label: "Foo(…)",
                         source_range: 46..48,
                         delete: 46..48,
-                        insert: "Foo($0)",
+                        insert: "Foo(${1:()}, ${2:()})$0",
                         kind: SymbolKind(
                             Variant,
                         ),
-                        lookup: "Foo",
-                        detail: "(i32, i32)",
-                        trigger_call_info: true,
+                        detail: "Foo(i32, i32)",
                     },
                 ]
             "#]],
@@ -512,7 +534,7 @@ fn main() { fo$0 }
     }
 
     #[test]
-    fn enum_detail_just_parentheses_for_unit() {
+    fn enum_detail_just_name_for_unit() {
         check(
             r#"
 enum Foo { Foo }
@@ -526,11 +548,11 @@ fn main() { Foo::Fo$0 }
                         label: "Foo",
                         source_range: 35..37,
                         delete: 35..37,
-                        insert: "Foo",
+                        insert: "Foo$0",
                         kind: SymbolKind(
                             Variant,
                         ),
-                        detail: "()",
+                        detail: "Foo",
                     },
                 ]
             "#]],
@@ -574,15 +596,15 @@ fn main() { let _: m::Spam = S$0 }
                         ),
                     },
                     CompletionItem {
-                        label: "Spam::Bar(…)",
+                        label: "m::Spam::Bar(…)",
                         source_range: 75..76,
                         delete: 75..76,
-                        insert: "Spam::Bar($0)",
+                        insert: "m::Spam::Bar(${1:()})$0",
                         kind: SymbolKind(
                             Variant,
                         ),
-                        lookup: "Spam::Bar",
-                        detail: "(i32)",
+                        lookup: "Spam::Bar(…)",
+                        detail: "m::Spam::Bar(i32)",
                         relevance: CompletionRelevance {
                             exact_name_match: false,
                             type_match: Some(
@@ -593,18 +615,17 @@ fn main() { let _: m::Spam = S$0 }
                             is_private_editable: false,
                             exact_postfix_snippet_match: false,
                         },
-                        trigger_call_info: true,
                     },
                     CompletionItem {
                         label: "m::Spam::Foo",
                         source_range: 75..76,
                         delete: 75..76,
-                        insert: "m::Spam::Foo",
+                        insert: "m::Spam::Foo$0",
                         kind: SymbolKind(
                             Variant,
                         ),
                         lookup: "Spam::Foo",
-                        detail: "()",
+                        detail: "m::Spam::Foo",
                         relevance: CompletionRelevance {
                             exact_name_match: false,
                             type_match: Some(
@@ -789,11 +810,11 @@ use self::E::*;
                         label: "V",
                         source_range: 10..12,
                         delete: 10..12,
-                        insert: "V",
+                        insert: "V$0",
                         kind: SymbolKind(
                             Variant,
                         ),
-                        detail: "()",
+                        detail: "V",
                         documentation: Documentation(
                             "variant docs",
                         ),
@@ -1161,6 +1182,7 @@ fn main() {
             "#,
             expect![[r#"
                 lc s [type+name+local]
+                st S [type]
                 st S []
                 fn main() []
                 fn foo(…) []
@@ -1177,6 +1199,7 @@ fn main() {
             "#,
             expect![[r#"
                 lc ssss [type+local]
+                st S [type]
                 st S []
                 fn main() []
                 fn foo(…) []

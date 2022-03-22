@@ -14,10 +14,10 @@ mod builtin_fn_macro;
 mod builtin_derive_macro;
 mod proc_macros;
 
-use std::{iter, ops::Range};
+use std::{iter, ops::Range, sync::Arc};
 
 use ::mbe::TokenMap;
-use base_db::{fixture::WithFixture, SourceDatabase};
+use base_db::{fixture::WithFixture, ProcMacro, SourceDatabase};
 use expect_test::Expect;
 use hir_expand::{
     db::{AstDatabase, TokenExpander},
@@ -33,13 +33,27 @@ use syntax::{
 use tt::{Subtree, TokenId};
 
 use crate::{
-    db::DefDatabase, nameres::ModuleSource, resolver::HasResolver, src::HasSource, test_db::TestDB,
-    AdtId, AsMacroCall, Lookup, ModuleDefId,
+    db::DefDatabase, macro_id_to_def_id, nameres::ModuleSource, resolver::HasResolver,
+    src::HasSource, test_db::TestDB, AdtId, AsMacroCall, Lookup, ModuleDefId,
 };
 
 #[track_caller]
 fn check(ra_fixture: &str, mut expect: Expect) {
-    let db = TestDB::with_files(ra_fixture);
+    let extra_proc_macros = vec![(
+        r#"
+#[proc_macro_attribute]
+pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+"#
+        .into(),
+        ProcMacro {
+            name: "identity_when_valid".into(),
+            kind: base_db::ProcMacroKind::Attr,
+            expander: Arc::new(IdentityWhenValidProcMacroExpander),
+        },
+    )];
+    let db = TestDB::with_files_extra_proc_macros(ra_fixture, extra_proc_macros);
     let krate = db.crate_graph().iter().next().unwrap();
     let def_map = db.crate_def_map(krate);
     let local_id = def_map.root();
@@ -114,7 +128,9 @@ fn check(ra_fixture: &str, mut expect: Expect) {
             .as_call_id_with_errors(
                 &db,
                 krate,
-                |path| resolver.resolve_path_as_macro(&db, &path),
+                |path| {
+                    resolver.resolve_path_as_macro(&db, &path).map(|it| macro_id_to_def_id(&db, it))
+                },
                 &mut |err| error = Some(err),
             )
             .unwrap()
@@ -162,7 +178,7 @@ fn check(ra_fixture: &str, mut expect: Expect) {
 
             if tree {
                 let tree = format!("{:#?}", parse.syntax_node())
-                    .split_inclusive("\n")
+                    .split_inclusive('\n')
                     .map(|line| format!("// {}", line))
                     .collect::<String>();
                 format_to!(expn_text, "\n{}", tree)
@@ -172,10 +188,10 @@ fn check(ra_fixture: &str, mut expect: Expect) {
         let range: Range<usize> = range.into();
 
         if show_token_ids {
-            if let Some((tree, map)) = arg.as_deref() {
+            if let Some((tree, map, _)) = arg.as_deref() {
                 let tt_range = call.token_tree().unwrap().syntax().text_range();
                 let mut ranges = Vec::new();
-                extract_id_ranges(&mut ranges, &map, &tree);
+                extract_id_ranges(&mut ranges, map, tree);
                 for (range, id) in ranges {
                     let idx = (tt_range.start() + range.end()).into();
                     text_edits.push((idx..idx, format!("#{}", id.0)));
@@ -201,10 +217,19 @@ fn check(ra_fixture: &str, mut expect: Expect) {
     }
 
     for decl_id in def_map[local_id].scope.declarations() {
-        if let ModuleDefId::AdtId(AdtId::StructId(struct_id)) = decl_id {
-            let src = struct_id.lookup(&db).source(&db);
+        // FIXME: I'm sure there's already better way to do this
+        let src = match decl_id {
+            ModuleDefId::AdtId(AdtId::StructId(struct_id)) => {
+                Some(struct_id.lookup(&db).source(&db).syntax().cloned())
+            }
+            ModuleDefId::FunctionId(function_id) => {
+                Some(function_id.lookup(&db).source(&db).syntax().cloned())
+            }
+            _ => None,
+        };
+        if let Some(src) = src {
             if src.file_id.is_attr_macro(&db) || src.file_id.is_custom_derive(&db) {
-                let pp = pretty_print_macro_expansion(src.value.syntax().clone(), None);
+                let pp = pretty_print_macro_expansion(src.value, None);
                 format_to!(expanded_text, "\n{}", pp)
             }
         }
@@ -244,7 +269,7 @@ fn reindent(indent: IndentLevel, pp: String) -> String {
     let mut res = lines.next().unwrap().to_string();
     for line in lines {
         if line.trim().is_empty() {
-            res.push_str(&line)
+            res.push_str(line)
         } else {
             format_to!(res, "{}{}", indent, line)
         }
@@ -279,6 +304,7 @@ fn pretty_print_macro_expansion(expn: SyntaxNode, map: Option<&TokenMap>) -> Str
             (T![fn], T!['(']) => "",
             (T![']'], _) if curr_kind.is_keyword() => " ",
             (T![']'], T![#]) => "\n",
+            (T![Self], T![::]) => "",
             _ if prev_kind.is_keyword() => " ",
             _ => "",
         };
@@ -303,4 +329,26 @@ fn pretty_print_macro_expansion(expn: SyntaxNode, map: Option<&TokenMap>) -> Str
         }
     }
     res
+}
+
+// Identity mapping, but only works when the input is syntactically valid. This
+// simulates common proc macros that unnecessarily parse their input and return
+// compile errors.
+#[derive(Debug)]
+struct IdentityWhenValidProcMacroExpander;
+impl base_db::ProcMacroExpander for IdentityWhenValidProcMacroExpander {
+    fn expand(
+        &self,
+        subtree: &Subtree,
+        _: Option<&Subtree>,
+        _: &base_db::Env,
+    ) -> Result<Subtree, base_db::ProcMacroExpansionError> {
+        let (parse, _) =
+            ::mbe::token_tree_to_syntax_node(subtree, ::mbe::TopEntryPoint::MacroItems);
+        if parse.errors().is_empty() {
+            Ok(subtree.clone())
+        } else {
+            panic!("got invalid macro input: {:?}", parse.errors());
+        }
+    }
 }

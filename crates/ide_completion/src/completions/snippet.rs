@@ -1,7 +1,7 @@
 //! This file provides snippet completions, like `pd` => `eprintln!(...)`.
 
 use hir::Documentation;
-use ide_db::helpers::{insert_use::ImportScope, SnippetCap};
+use ide_db::{imports::insert_use::ImportScope, SnippetCap};
 use syntax::T;
 
 use crate::{
@@ -112,7 +112,7 @@ fn add_custom_completions(
                 None => return,
             };
             let body = snip.snippet();
-            let mut builder = snippet(ctx, cap, &trigger, &body);
+            let mut builder = snippet(ctx, cap, trigger, &body);
             builder.documentation(Documentation::new(format!("```rust\n{}\n```", body)));
             for import in imports.into_iter() {
                 builder.add_import(import);

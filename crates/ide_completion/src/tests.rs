@@ -27,11 +27,8 @@ use std::mem;
 use hir::{db::DefDatabase, PrefixKind, Semantics};
 use ide_db::{
     base_db::{fixture::ChangeFixture, FileLoader, FilePosition},
-    helpers::{
-        insert_use::{ImportGranularity, InsertUseConfig},
-        SnippetCap,
-    },
-    RootDatabase,
+    imports::insert_use::{ImportGranularity, InsertUseConfig},
+    RootDatabase, SnippetCap,
 };
 use itertools::Itertools;
 use stdx::{format_to, trim_indent};
@@ -64,6 +61,7 @@ pub(crate) const TEST_CONFIG: CompletionConfig = CompletionConfig {
     enable_postfix_completions: true,
     enable_imports_on_the_fly: true,
     enable_self_on_the_fly: true,
+    enable_private_editable: true,
     add_call_parenthesis: true,
     add_call_argument_snippets: true,
     snippet_cap: SnippetCap::new(true),
@@ -156,10 +154,12 @@ fn render_completion_list(completions: Vec<CompletionItem>) -> String {
         .collect()
 }
 
+#[track_caller]
 pub(crate) fn check_edit(what: &str, ra_fixture_before: &str, ra_fixture_after: &str) {
     check_edit_with_config(TEST_CONFIG, what, ra_fixture_before, ra_fixture_after)
 }
 
+#[track_caller]
 pub(crate) fn check_edit_with_config(
     config: CompletionConfig,
     what: &str,
@@ -201,32 +201,14 @@ pub(crate) fn check_pattern_is_applicable(code: &str, check: impl FnOnce(SyntaxE
     assert!(check(NodeOrToken::Token(token)));
 }
 
-pub(crate) fn check_pattern_is_not_applicable(code: &str, check: fn(SyntaxElement) -> bool) {
-    let (db, pos) = position(code);
-    let sema = Semantics::new(&db);
-    let original_file = sema.parse(pos.file_id);
-    let token = original_file.syntax().token_at_offset(pos.offset).left_biased().unwrap();
-    assert!(!check(NodeOrToken::Token(token)));
-}
-
 pub(crate) fn get_all_items(config: CompletionConfig, code: &str) -> Vec<CompletionItem> {
     let (db, position) = position(code);
     crate::completions(&db, &config, position).map_or_else(Vec::default, Into::into)
 }
 
-fn check_no_completion(ra_fixture: &str) {
-    let (db, position) = position(ra_fixture);
-
-    assert!(
-        crate::completions(&db, &TEST_CONFIG, position).is_none(),
-        "Completions were generated, but weren't expected"
-    );
-}
-
 #[test]
 fn test_no_completions_required() {
-    cov_mark::check!(no_completion_required);
-    check_no_completion(r#"fn foo() { for i i$0 }"#);
+    assert_eq!(completion_list(r#"fn foo() { for i i$0 }"#), String::new());
 }
 
 #[test]

@@ -1,29 +1,48 @@
 use either::Either;
 use hir::{known, Callable, HasVisibility, HirDisplay, Semantics, TypeInfo};
-use ide_db::{base_db::FileRange, helpers::FamousDefs, RootDatabase};
+use ide_db::{
+    base_db::FileRange, famous_defs::FamousDefs, syntax_helpers::node_ext::walk_ty, RootDatabase,
+};
 use itertools::Itertools;
+use rustc_hash::FxHashMap;
 use stdx::to_lower_snake_case;
 use syntax::{
-    ast::{self, AstNode, HasArgList, HasName, UnaryOp},
-    match_ast, Direction, NodeOrToken, SmolStr, SyntaxKind, TextRange, T,
+    ast::{self, AstNode, HasArgList, HasGenericParams, HasName, UnaryOp},
+    match_ast, Direction, NodeOrToken, SmolStr, SyntaxKind, SyntaxNode, TextRange, T,
 };
 
 use crate::FileId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlayHintsConfig {
+    pub render_colons: bool,
     pub type_hints: bool,
     pub parameter_hints: bool,
     pub chaining_hints: bool,
+    pub reborrow_hints: bool,
+    pub closure_return_type_hints: bool,
+    pub lifetime_elision_hints: LifetimeElisionHints,
+    pub param_names_for_lifetime_elision_hints: bool,
     pub hide_named_constructor_hints: bool,
     pub max_length: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifetimeElisionHints {
+    Always,
+    SkipTrivial,
+    Never,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InlayKind {
+    ImplicitReborrow,
     TypeHint,
     ParameterHint,
+    ClosureReturnTypeHint,
     ChainingHint,
+    GenericParamListHint,
+    LifetimeHint,
 }
 
 #[derive(Debug)]
@@ -38,15 +57,17 @@ pub struct InlayHint {
 // rust-analyzer shows additional information inline with the source code.
 // Editors usually render this using read-only virtual text snippets interspersed with code.
 //
-// rust-analyzer shows hints for
+// rust-analyzer by default shows hints for
 //
 // * types of local variables
 // * names of function arguments
 // * types of chained expressions
 //
-// **Note:** VS Code does not have native support for inlay hints https://github.com/microsoft/vscode/issues/16221[yet] and the hints are implemented using decorations.
-// This approach has limitations, the caret movement and bracket highlighting near the edges of the hint may be weird:
-// https://github.com/rust-analyzer/rust-analyzer/issues/1623[1], https://github.com/rust-analyzer/rust-analyzer/issues/3453[2].
+// Optionally, one can enable additional hints for
+//
+// * return types of closure expressions with blocks
+// * elided lifetimes
+// * compiler inserted reborrows
 //
 // |===
 // | Editor  | Action Name
@@ -58,6 +79,7 @@ pub struct InlayHint {
 pub(crate) fn inlay_hints(
     db: &RootDatabase,
     file_id: FileId,
+    range_limit: Option<FileRange>,
     config: &InlayHintsConfig,
 ) -> Vec<InlayHint> {
     let _p = profile::span("inlay_hints");
@@ -65,30 +87,308 @@ pub(crate) fn inlay_hints(
     let file = sema.parse(file_id);
     let file = file.syntax();
 
-    let mut res = Vec::new();
+    let mut acc = Vec::new();
 
-    for node in file.descendants() {
-        if let Some(expr) = ast::Expr::cast(node.clone()) {
-            get_chaining_hints(&mut res, &sema, config, &expr);
-            match expr {
-                ast::Expr::CallExpr(it) => {
-                    get_param_name_hints(&mut res, &sema, config, ast::Expr::from(it));
-                }
-                ast::Expr::MethodCallExpr(it) => {
-                    get_param_name_hints(&mut res, &sema, config, ast::Expr::from(it));
-                }
-                _ => (),
-            }
-        } else if let Some(it) = ast::IdentPat::cast(node.clone()) {
-            get_bind_pat_hints(&mut res, &sema, config, &it);
-        }
-    }
-    res
+    let hints = |node| hints(&mut acc, &sema, config, node);
+    match range_limit {
+        Some(FileRange { range, .. }) => match file.covering_element(range) {
+            NodeOrToken::Token(_) => return acc,
+            NodeOrToken::Node(n) => n
+                .descendants()
+                .filter(|descendant| range.contains_range(descendant.text_range()))
+                .for_each(hints),
+        },
+        None => file.descendants().for_each(hints),
+    };
+
+    acc
 }
 
-fn get_chaining_hints(
+fn hints(
+    hints: &mut Vec<InlayHint>,
+    sema: &Semantics<RootDatabase>,
+    config: &InlayHintsConfig,
+    node: SyntaxNode,
+) {
+    let krate = sema.scope(&node).module().map(|it| it.krate());
+    let famous_defs = FamousDefs(sema, krate);
+    if let Some(expr) = ast::Expr::cast(node.clone()) {
+        chaining_hints(hints, sema, &famous_defs, config, &expr);
+        match expr {
+            ast::Expr::CallExpr(it) => param_name_hints(hints, sema, config, ast::Expr::from(it)),
+            ast::Expr::MethodCallExpr(it) => {
+                param_name_hints(hints, sema, config, ast::Expr::from(it))
+            }
+            ast::Expr::ClosureExpr(it) => closure_ret_hints(hints, sema, &famous_defs, config, it),
+            // We could show reborrows for all expressions, but usually that is just noise to the user
+            // and the main point here is to show why "moving" a mutable reference doesn't necessarily move it
+            ast::Expr::PathExpr(_) => reborrow_hints(hints, sema, config, &expr),
+            _ => None,
+        };
+    } else if let Some(it) = ast::IdentPat::cast(node.clone()) {
+        bind_pat_hints(hints, sema, config, &it);
+    } else if let Some(it) = ast::Fn::cast(node) {
+        lifetime_hints(hints, config, it);
+    }
+}
+
+fn lifetime_hints(
+    acc: &mut Vec<InlayHint>,
+    config: &InlayHintsConfig,
+    func: ast::Fn,
+) -> Option<()> {
+    if config.lifetime_elision_hints == LifetimeElisionHints::Never {
+        return None;
+    }
+    let param_list = func.param_list()?;
+    let generic_param_list = func.generic_param_list();
+    let ret_type = func.ret_type();
+    let self_param = param_list.self_param().filter(|it| it.amp_token().is_some());
+
+    let mut used_names: FxHashMap<SmolStr, usize> = generic_param_list
+        .iter()
+        .filter(|_| config.param_names_for_lifetime_elision_hints)
+        .flat_map(|gpl| gpl.lifetime_params())
+        .filter_map(|param| param.lifetime())
+        .filter_map(|lt| Some((SmolStr::from(lt.text().as_str().get(1..)?), 0)))
+        .collect();
+
+    let mut allocated_lifetimes = vec![];
+    let mut gen_idx_name = {
+        let mut gen = (0u8..).map(|idx| match idx {
+            idx if idx < 10 => SmolStr::from_iter(['\'', (idx + 48) as char]),
+            idx => format!("'{idx}").into(),
+        });
+        move || gen.next().unwrap_or_default()
+    };
+
+    let mut potential_lt_refs: Vec<_> = vec![];
+    param_list
+        .params()
+        .filter_map(|it| {
+            Some((
+                config.param_names_for_lifetime_elision_hints.then(|| it.pat()).flatten(),
+                it.ty()?,
+            ))
+        })
+        .for_each(|(pat, ty)| {
+            // FIXME: check path types
+            walk_ty(&ty, &mut |ty| match ty {
+                ast::Type::RefType(r) => potential_lt_refs.push((
+                    pat.as_ref().and_then(|it| match it {
+                        ast::Pat::IdentPat(p) => p.name(),
+                        _ => None,
+                    }),
+                    r,
+                )),
+                _ => (),
+            })
+        });
+
+    enum LifetimeKind {
+        Elided,
+        Named(SmolStr),
+        Static,
+    }
+
+    let fetch_lt_text = |lt: Option<ast::Lifetime>| match lt {
+        Some(lt) => match lt.text().as_str() {
+            "'_" => LifetimeKind::Elided,
+            "'static" => LifetimeKind::Static,
+            name => LifetimeKind::Named(name.into()),
+        },
+        None => LifetimeKind::Elided,
+    };
+    let is_elided = |lt: Option<ast::Lifetime>| match lt {
+        Some(lt) => matches!(lt.text().as_str(), "'_"),
+        None => true,
+    };
+
+    // allocate names
+    if let Some(self_param) = &self_param {
+        if is_elided(self_param.lifetime()) {
+            allocated_lifetimes.push(if config.param_names_for_lifetime_elision_hints {
+                // self can't be used as a lifetime, so no need to check for collisions
+                "'self".into()
+            } else {
+                gen_idx_name()
+            });
+        }
+    }
+    potential_lt_refs.iter().for_each(|(name, it)| {
+        if is_elided(it.lifetime()) {
+            let name = match name {
+                Some(it) => {
+                    if let Some(c) = used_names.get_mut(it.text().as_str()) {
+                        *c += 1;
+                        SmolStr::from(format!("'{text}{c}", text = it.text().as_str()))
+                    } else {
+                        used_names.insert(it.text().as_str().into(), 0);
+                        SmolStr::from_iter(["\'", it.text().as_str()])
+                    }
+                }
+                _ => gen_idx_name(),
+            };
+            allocated_lifetimes.push(name);
+        }
+    });
+
+    // fetch output lifetime if elision rule applies
+
+    let output = if let Some(self_param) = &self_param {
+        match fetch_lt_text(self_param.lifetime()) {
+            LifetimeKind::Elided => allocated_lifetimes.get(0).cloned(),
+            LifetimeKind::Named(name) => Some(name),
+            LifetimeKind::Static => None,
+        }
+    } else {
+        match potential_lt_refs.as_slice() {
+            [(_, r)] => match fetch_lt_text(r.lifetime()) {
+                LifetimeKind::Elided => allocated_lifetimes.get(0).cloned(),
+                LifetimeKind::Named(name) => Some(name),
+                LifetimeKind::Static => None,
+            },
+            [..] => None,
+        }
+    };
+
+    if allocated_lifetimes.is_empty() && output.is_none() {
+        return None;
+    }
+
+    // apply hints
+    // apply output if required
+    let mut is_trivial = true;
+    if let (Some(output_lt), Some(r)) = (&output, ret_type) {
+        if let Some(ty) = r.ty() {
+            walk_ty(&ty, &mut |ty| match ty {
+                ast::Type::RefType(ty) if ty.lifetime().is_none() => {
+                    if let Some(amp) = ty.amp_token() {
+                        is_trivial = false;
+                        acc.push(InlayHint {
+                            range: amp.text_range(),
+                            kind: InlayKind::LifetimeHint,
+                            label: output_lt.clone(),
+                        });
+                    }
+                }
+                _ => (),
+            })
+        }
+    }
+
+    if config.lifetime_elision_hints == LifetimeElisionHints::SkipTrivial && is_trivial {
+        return None;
+    }
+
+    let mut idx = match &self_param {
+        Some(self_param) if is_elided(self_param.lifetime()) => {
+            if let Some(amp) = self_param.amp_token() {
+                let lt = allocated_lifetimes[0].clone();
+                acc.push(InlayHint {
+                    range: amp.text_range(),
+                    kind: InlayKind::LifetimeHint,
+                    label: lt,
+                });
+            }
+            1
+        }
+        _ => 0,
+    };
+
+    for (_, p) in potential_lt_refs.iter() {
+        if is_elided(p.lifetime()) {
+            let t = p.amp_token()?;
+            let lt = allocated_lifetimes[idx].clone();
+            acc.push(InlayHint { range: t.text_range(), kind: InlayKind::LifetimeHint, label: lt });
+            idx += 1;
+        }
+    }
+
+    // generate generic param list things
+    match (generic_param_list, allocated_lifetimes.as_slice()) {
+        (_, []) => (),
+        (Some(gpl), allocated_lifetimes) => {
+            let angle_tok = gpl.l_angle_token()?;
+            let is_empty = gpl.generic_params().next().is_none();
+            acc.push(InlayHint {
+                range: angle_tok.text_range(),
+                kind: InlayKind::GenericParamListHint,
+                label: format!(
+                    "{}{}",
+                    allocated_lifetimes.iter().format(", "),
+                    if is_empty { "" } else { ", " }
+                )
+                .into(),
+            });
+        }
+        (None, allocated_lifetimes) => acc.push(InlayHint {
+            range: func.name()?.syntax().text_range(),
+            kind: InlayKind::GenericParamListHint,
+            label: format!("<{}>", allocated_lifetimes.iter().format(", "),).into(),
+        }),
+    }
+    Some(())
+}
+
+fn closure_ret_hints(
     acc: &mut Vec<InlayHint>,
     sema: &Semantics<RootDatabase>,
+    famous_defs: &FamousDefs,
+    config: &InlayHintsConfig,
+    closure: ast::ClosureExpr,
+) -> Option<()> {
+    if !config.closure_return_type_hints {
+        return None;
+    }
+
+    let param_list = match closure.body() {
+        Some(ast::Expr::BlockExpr(_)) => closure.param_list()?,
+        _ => return None,
+    };
+
+    let closure = sema.descend_node_into_attributes(closure.clone()).pop()?;
+    let ty = sema.type_of_expr(&ast::Expr::ClosureExpr(closure))?.adjusted();
+    let callable = ty.as_callable(sema.db)?;
+    let ty = callable.return_type();
+    if ty.is_unit() {
+        return None;
+    }
+    acc.push(InlayHint {
+        range: param_list.syntax().text_range(),
+        kind: InlayKind::ClosureReturnTypeHint,
+        label: hint_iterator(sema, &famous_defs, config, &ty)
+            .unwrap_or_else(|| ty.display_truncated(sema.db, config.max_length).to_string().into()),
+    });
+    Some(())
+}
+
+fn reborrow_hints(
+    acc: &mut Vec<InlayHint>,
+    sema: &Semantics<RootDatabase>,
+    config: &InlayHintsConfig,
+    expr: &ast::Expr,
+) -> Option<()> {
+    if !config.reborrow_hints {
+        return None;
+    }
+
+    let mutability = sema.is_implicit_reborrow(expr)?;
+    acc.push(InlayHint {
+        range: expr.syntax().text_range(),
+        kind: InlayKind::ImplicitReborrow,
+        label: match mutability {
+            hir::Mutability::Shared => SmolStr::new_inline("&*"),
+            hir::Mutability::Mut => SmolStr::new_inline("&mut *"),
+        },
+    });
+    Some(())
+}
+
+fn chaining_hints(
+    acc: &mut Vec<InlayHint>,
+    sema: &Semantics<RootDatabase>,
+    famous_defs: &FamousDefs,
     config: &InlayHintsConfig,
     expr: &ast::Expr,
 ) -> Option<()> {
@@ -102,8 +402,6 @@ fn get_chaining_hints(
 
     let descended = sema.descend_node_into_attributes(expr.clone()).pop();
     let desc_expr = descended.as_ref().unwrap_or(expr);
-    let krate = sema.scope(desc_expr.syntax()).module().map(|it| it.krate());
-    let famous_defs = FamousDefs(sema, krate);
 
     let mut tokens = expr
         .syntax()
@@ -147,7 +445,7 @@ fn get_chaining_hints(
     Some(())
 }
 
-fn get_param_name_hints(
+fn param_name_hints(
     acc: &mut Vec<InlayHint>,
     sema: &Semantics<RootDatabase>,
     config: &InlayHintsConfig,
@@ -187,7 +485,7 @@ fn get_param_name_hints(
     Some(())
 }
 
-fn get_bind_pat_hints(
+fn bind_pat_hints(
     acc: &mut Vec<InlayHint>,
     sema: &Semantics<RootDatabase>,
     config: &InlayHintsConfig,
@@ -243,7 +541,7 @@ fn is_named_constructor(
     let expr = match_ast! {
         match let_node {
             ast::LetStmt(it) => it.initializer(),
-            ast::Condition(it) => it.expr(),
+            ast::LetExpr(it) => it.expr(),
             _ => None,
         }
     }?;
@@ -372,15 +670,10 @@ fn should_not_display_type_hint(
             match node {
                 ast::LetStmt(it) => return it.ty().is_some(),
                 ast::Param(it) => return it.ty().is_some(),
-                ast::MatchArm(_it) => return pat_is_enum_variant(db, bind_pat, pat_ty),
-                ast::IfExpr(it) => {
-                    return it.condition().and_then(|condition| condition.pat()).is_some()
-                        && pat_is_enum_variant(db, bind_pat, pat_ty);
-                },
-                ast::WhileExpr(it) => {
-                    return it.condition().and_then(|condition| condition.pat()).is_some()
-                        && pat_is_enum_variant(db, bind_pat, pat_ty);
-                },
+                ast::MatchArm(_) => return pat_is_enum_variant(db, bind_pat, pat_ty),
+                ast::LetExpr(_) => return pat_is_enum_variant(db, bind_pat, pat_ty),
+                ast::IfExpr(_) => return false,
+                ast::WhileExpr(_) => return false,
                 ast::ForExpr(it) => {
                     // We *should* display hint only if user provided "in {expr}" and we know the type of expr (and it's not unit).
                     // Type of expr should be iterable.
@@ -546,16 +839,33 @@ fn get_callable(
 #[cfg(test)]
 mod tests {
     use expect_test::{expect, Expect};
+    use ide_db::base_db::FileRange;
+    use itertools::Itertools;
+    use syntax::{TextRange, TextSize};
     use test_utils::extract_annotations;
 
-    use crate::{fixture, inlay_hints::InlayHintsConfig};
+    use crate::{fixture, inlay_hints::InlayHintsConfig, LifetimeElisionHints};
 
+    const DISABLED_CONFIG: InlayHintsConfig = InlayHintsConfig {
+        render_colons: false,
+        type_hints: false,
+        parameter_hints: false,
+        chaining_hints: false,
+        lifetime_elision_hints: LifetimeElisionHints::Never,
+        hide_named_constructor_hints: false,
+        closure_return_type_hints: false,
+        reborrow_hints: false,
+        param_names_for_lifetime_elision_hints: false,
+        max_length: None,
+    };
     const TEST_CONFIG: InlayHintsConfig = InlayHintsConfig {
         type_hints: true,
         parameter_hints: true,
         chaining_hints: true,
-        hide_named_constructor_hints: false,
-        max_length: None,
+        reborrow_hints: true,
+        closure_return_type_hints: true,
+        lifetime_elision_hints: LifetimeElisionHints::Always,
+        ..DISABLED_CONFIG
     };
 
     #[track_caller]
@@ -566,72 +876,47 @@ mod tests {
     #[track_caller]
     fn check_params(ra_fixture: &str) {
         check_with_config(
-            InlayHintsConfig {
-                parameter_hints: true,
-                type_hints: false,
-                chaining_hints: false,
-                hide_named_constructor_hints: false,
-                max_length: None,
-            },
+            InlayHintsConfig { parameter_hints: true, ..DISABLED_CONFIG },
             ra_fixture,
         );
     }
 
     #[track_caller]
     fn check_types(ra_fixture: &str) {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: true,
-                chaining_hints: false,
-                hide_named_constructor_hints: false,
-                max_length: None,
-            },
-            ra_fixture,
-        );
+        check_with_config(InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG }, ra_fixture);
     }
 
     #[track_caller]
     fn check_chains(ra_fixture: &str) {
-        check_with_config(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: false,
-                chaining_hints: true,
-                hide_named_constructor_hints: false,
-                max_length: None,
-            },
-            ra_fixture,
-        );
+        check_with_config(InlayHintsConfig { chaining_hints: true, ..DISABLED_CONFIG }, ra_fixture);
     }
 
     #[track_caller]
     fn check_with_config(config: InlayHintsConfig, ra_fixture: &str) {
         let (analysis, file_id) = fixture::file(ra_fixture);
-        let expected = extract_annotations(&*analysis.file_text(file_id).unwrap());
-        let inlay_hints = analysis.inlay_hints(&config, file_id).unwrap();
-        let actual =
-            inlay_hints.into_iter().map(|it| (it.range, it.label.to_string())).collect::<Vec<_>>();
+        let mut expected = extract_annotations(&*analysis.file_text(file_id).unwrap());
+        let inlay_hints = analysis.inlay_hints(&config, file_id, None).unwrap();
+        let actual = inlay_hints
+            .into_iter()
+            .map(|it| (it.range, it.label.to_string()))
+            .sorted_by_key(|(range, _)| range.start())
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|(range, _)| range.start());
+
         assert_eq!(expected, actual, "\nExpected:\n{:#?}\n\nActual:\n{:#?}", expected, actual);
     }
 
     #[track_caller]
     fn check_expect(config: InlayHintsConfig, ra_fixture: &str, expect: Expect) {
         let (analysis, file_id) = fixture::file(ra_fixture);
-        let inlay_hints = analysis.inlay_hints(&config, file_id).unwrap();
+        let inlay_hints = analysis.inlay_hints(&config, file_id, None).unwrap();
         expect.assert_debug_eq(&inlay_hints)
     }
 
     #[test]
     fn hints_disabled() {
         check_with_config(
-            InlayHintsConfig {
-                type_hints: false,
-                parameter_hints: false,
-                chaining_hints: false,
-                hide_named_constructor_hints: false,
-                max_length: None,
-            },
+            InlayHintsConfig { render_colons: true, ..DISABLED_CONFIG },
             r#"
 fn foo(a: i32, b: i32) -> i32 { a + b }
 fn main() {
@@ -1051,6 +1336,49 @@ fn main() {
     }
 
     #[test]
+    fn check_hint_range_limit() {
+        let fixture = r#"
+        //- minicore: fn, sized
+        fn foo() -> impl Fn() { loop {} }
+        fn foo1() -> impl Fn(f64) { loop {} }
+        fn foo2() -> impl Fn(f64, f64) { loop {} }
+        fn foo3() -> impl Fn(f64, f64) -> u32 { loop {} }
+        fn foo4() -> &'static dyn Fn(f64, f64) -> u32 { loop {} }
+        fn foo5() -> &'static dyn Fn(&'static dyn Fn(f64, f64) -> u32, f64) -> u32 { loop {} }
+        fn foo6() -> impl Fn(f64, f64) -> u32 + Sized { loop {} }
+        fn foo7() -> *const (impl Fn(f64, f64) -> u32 + Sized) { loop {} }
+
+        fn main() {
+            let foo = foo();
+            let foo = foo1();
+            let foo = foo2();
+            let foo = foo3();
+             // ^^^ impl Fn(f64, f64) -> u32
+            let foo = foo4();
+             // ^^^ &dyn Fn(f64, f64) -> u32
+            let foo = foo5();
+            let foo = foo6();
+            let foo = foo7();
+        }
+        "#;
+        let (analysis, file_id) = fixture::file(fixture);
+        let expected = extract_annotations(&*analysis.file_text(file_id).unwrap());
+        let inlay_hints = analysis
+            .inlay_hints(
+                &InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
+                file_id,
+                Some(FileRange {
+                    file_id,
+                    range: TextRange::new(TextSize::from(500), TextSize::from(600)),
+                }),
+            )
+            .unwrap();
+        let actual =
+            inlay_hints.into_iter().map(|it| (it.range, it.label.to_string())).collect::<Vec<_>>();
+        assert_eq!(expected, actual, "\nExpected:\n{:#?}\n\nActual:\n{:#?}", expected, actual);
+    }
+
+    #[test]
     fn fn_hints_ptr_rpit_fn_parentheses() {
         check_types(
             r#"
@@ -1213,41 +1541,6 @@ fn main() {
     }
 
     #[test]
-    fn incomplete_for_no_hint() {
-        check_types(
-            r#"
-fn main() {
-    let data = &[1i32, 2, 3];
-      //^^^^ &[i32; 3]
-    for i
-}"#,
-        );
-        check(
-            r#"
-pub struct Vec<T> {}
-
-impl<T> Vec<T> {
-    pub fn new() -> Self { Vec {} }
-    pub fn push(&mut self, t: T) {}
-}
-
-impl<T> IntoIterator for Vec<T> {
-    type Item=T;
-}
-
-fn main() {
-    let mut data = Vec::new();
-          //^^^^ Vec<&str>
-    data.push("foo");
-    for i in
-
-    println!("Unit expr");
-}
-"#,
-        );
-    }
-
-    #[test]
     fn complete_for_hint() {
         check_types(
             r#"
@@ -1341,11 +1634,12 @@ fn main() {
     fn skip_constructor_and_enum_type_hints() {
         check_with_config(
             InlayHintsConfig {
+                render_colons: true,
                 type_hints: true,
                 parameter_hints: true,
                 chaining_hints: true,
                 hide_named_constructor_hints: true,
-                max_length: None,
+                ..DISABLED_CONFIG
             },
             r#"
 //- minicore: try, option
@@ -1473,13 +1767,14 @@ fn fallible() -> ControlFlow<()> {
 fn main() {
     let mut start = 0;
           //^^^^^ i32
-    (0..2).for_each(|increment| { start += increment; });
+    (0..2).for_each(|increment      | { start += increment; });
                    //^^^^^^^^^ i32
 
     let multiply =
       //^^^^^^^^ |i32, i32| -> i32
       | a,     b| a * b
       //^ i32  ^ i32
+
     ;
 
     let _: i32 = multiply(1, 2);
@@ -1488,6 +1783,8 @@ fn main() {
 
     let return_42 = || 42;
       //^^^^^^^^^ || -> i32
+      || { 42 };
+    //^^ i32
 }"#,
         );
     }
@@ -1517,13 +1814,7 @@ fn main() {
     #[test]
     fn chaining_hints_ignore_comments() {
         check_expect(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: false,
-                chaining_hints: true,
-                hide_named_constructor_hints: false,
-                max_length: None,
-            },
+            InlayHintsConfig { type_hints: false, chaining_hints: true, ..DISABLED_CONFIG },
             r#"
 struct A(B);
 impl A { fn into_b(self) -> B { self.0 } }
@@ -1574,13 +1865,7 @@ fn main() {
     #[test]
     fn struct_access_chaining_hints() {
         check_expect(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: false,
-                chaining_hints: true,
-                hide_named_constructor_hints: false,
-                max_length: None,
-            },
+            InlayHintsConfig { chaining_hints: true, ..DISABLED_CONFIG },
             r#"
 struct A { pub b: B }
 struct B { pub c: C }
@@ -1619,13 +1904,7 @@ fn main() {
     #[test]
     fn generic_chaining_hints() {
         check_expect(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: false,
-                chaining_hints: true,
-                hide_named_constructor_hints: false,
-                max_length: None,
-            },
+            InlayHintsConfig { chaining_hints: true, ..DISABLED_CONFIG },
             r#"
 struct A<T>(T);
 struct B<T>(T);
@@ -1665,13 +1944,7 @@ fn main() {
     #[test]
     fn shorten_iterator_chaining_hints() {
         check_expect(
-            InlayHintsConfig {
-                parameter_hints: false,
-                type_hints: false,
-                chaining_hints: true,
-                hide_named_constructor_hints: false,
-                max_length: None,
-            },
+            InlayHintsConfig { chaining_hints: true, ..DISABLED_CONFIG },
             r#"
 //- minicore: iterators
 use core::iter;
@@ -1766,6 +2039,140 @@ fn main() {
                     },
                 ]
             "#]],
+        );
+    }
+
+    #[test]
+    fn hints_lifetimes() {
+        check(
+            r#"
+fn empty() {}
+
+fn no_gpl(a: &()) {}
+ //^^^^^^<'0>
+          // ^'0
+fn empty_gpl<>(a: &()) {}
+      //    ^'0   ^'0
+fn partial<'b>(a: &(), b: &'b ()) {}
+//        ^'0, $  ^'0
+fn partial<'a>(a: &'a (), b: &()) {}
+//        ^'0, $             ^'0
+
+fn single_ret(a: &()) -> &() {}
+// ^^^^^^^^^^<'0>
+              // ^'0     ^'0
+fn full_mul(a: &(), b: &()) {}
+// ^^^^^^^^<'0, '1>
+            // ^'0     ^'1
+
+fn foo<'c>(a: &'c ()) -> &() {}
+                      // ^'c
+
+fn nested_in(a: &   &X< &()>) {}
+// ^^^^^^^^^<'0, '1, '2>
+              //^'0 ^'1 ^'2
+fn nested_out(a: &()) -> &   &X< &()>{}
+// ^^^^^^^^^^<'0>
+               //^'0     ^'0 ^'0 ^'0
+
+impl () {
+    fn foo(&self) {}
+    // ^^^<'0>
+        // ^'0
+    fn foo(&self) -> &() {}
+    // ^^^<'0>
+        // ^'0       ^'0
+    fn foo(&self, a: &()) -> &() {}
+    // ^^^<'0, '1>
+        // ^'0       ^'1     ^'0
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn hints_lifetimes_named() {
+        check_with_config(
+            InlayHintsConfig { param_names_for_lifetime_elision_hints: true, ..TEST_CONFIG },
+            r#"
+fn nested_in<'named>(named: &        &X<      &()>) {}
+//          ^'named1, 'named2, 'named3, $
+                          //^'named1 ^'named2 ^'named3
+"#,
+        );
+    }
+
+    #[test]
+    fn hints_lifetimes_trivial_skip() {
+        check_with_config(
+            InlayHintsConfig {
+                lifetime_elision_hints: LifetimeElisionHints::SkipTrivial,
+                ..TEST_CONFIG
+            },
+            r#"
+fn no_gpl(a: &()) {}
+fn empty_gpl<>(a: &()) {}
+fn partial<'b>(a: &(), b: &'b ()) {}
+fn partial<'a>(a: &'a (), b: &()) {}
+
+fn single_ret(a: &()) -> &() {}
+// ^^^^^^^^^^<'0>
+              // ^'0     ^'0
+fn full_mul(a: &(), b: &()) {}
+
+fn foo<'c>(a: &'c ()) -> &() {}
+                      // ^'c
+
+fn nested_in(a: &   &X< &()>) {}
+fn nested_out(a: &()) -> &   &X< &()>{}
+// ^^^^^^^^^^<'0>
+               //^'0     ^'0 ^'0 ^'0
+
+impl () {
+    fn foo(&self) {}
+    fn foo(&self) -> &() {}
+    // ^^^<'0>
+        // ^'0       ^'0
+    fn foo(&self, a: &()) -> &() {}
+    // ^^^<'0, '1>
+        // ^'0       ^'1     ^'0
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn hints_implicit_reborrow() {
+        check_with_config(
+            InlayHintsConfig { reborrow_hints: true, ..DISABLED_CONFIG },
+            r#"
+fn __() {
+    let unique = &mut ();
+    let r_mov = unique;
+    let foo: &mut _ = unique;
+                    //^^^^^^ &mut *
+    ref_mut_id(unique);
+             //^^^^^^ &mut *
+    let shared = ref_id(unique);
+                      //^^^^^^ &*
+    let mov = shared;
+    let r_mov: &_ = shared;
+    ref_id(shared);
+
+    identity(unique);
+    identity(shared);
+}
+fn identity<T>(t: T) -> T {
+    t
+}
+fn ref_mut_id(x: &mut ()) -> &mut () {
+    x
+  //^ &mut *
+}
+fn ref_id(x: &()) -> &() {
+    x
+}
+"#,
         );
     }
 }

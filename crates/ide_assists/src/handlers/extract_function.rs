@@ -5,13 +5,11 @@ use either::Either;
 use hir::{HirDisplay, InFile, Local, ModuleDef, Semantics, TypeInfo};
 use ide_db::{
     defs::{Definition, NameRefClass},
-    helpers::{
-        insert_use::{insert_use, ImportScope},
-        mod_path_to_ast,
-        node_ext::{preorder_expr, walk_expr, walk_pat, walk_patterns_in_expr},
-        FamousDefs,
-    },
+    famous_defs::FamousDefs,
+    helpers::mod_path_to_ast,
+    imports::insert_use::{insert_use, ImportScope},
     search::{FileReference, ReferenceCategory, SearchScope},
+    syntax_helpers::node_ext::{preorder_expr, walk_expr, walk_pat, walk_patterns_in_expr},
     FxIndexSet, RootDatabase,
 };
 use itertools::Itertools;
@@ -289,10 +287,10 @@ enum FlowKind {
     Try {
         kind: TryKind,
     },
-    /// Break with value (`break $expr;`)
-    Break(Option<ast::Expr>),
-    /// Continue
-    Continue,
+    /// Break with label and value (`break 'label $expr;`)
+    Break(Option<ast::Lifetime>, Option<ast::Expr>),
+    /// Continue with label (`continue 'label;`)
+    Continue(Option<ast::Lifetime>),
 }
 
 #[derive(Debug, Clone)]
@@ -393,7 +391,7 @@ impl Param {
     }
 
     fn to_param(&self, ctx: &AssistContext, module: hir::Module) -> ast::Param {
-        let var = self.var.name(ctx.db()).unwrap().to_string();
+        let var = self.var.name(ctx.db()).to_string();
         let var_name = make::name(&var);
         let pat = match self.kind() {
             ParamKind::MutValue => make::ident_pat(false, true, var_name),
@@ -435,21 +433,21 @@ impl FlowKind {
     fn make_result_handler(&self, expr: Option<ast::Expr>) -> ast::Expr {
         match self {
             FlowKind::Return(_) => make::expr_return(expr),
-            FlowKind::Break(_) => make::expr_break(expr),
+            FlowKind::Break(label, _) => make::expr_break(label.clone(), expr),
             FlowKind::Try { .. } => {
                 stdx::never!("cannot have result handler with try");
                 expr.unwrap_or_else(|| make::expr_return(None))
             }
-            FlowKind::Continue => {
+            FlowKind::Continue(label) => {
                 stdx::always!(expr.is_none(), "continue with value is not possible");
-                make::expr_continue()
+                make::expr_continue(label.clone())
             }
         }
     }
 
     fn expr_ty(&self, ctx: &AssistContext) -> Option<hir::Type> {
         match self {
-            FlowKind::Return(Some(expr)) | FlowKind::Break(Some(expr)) => {
+            FlowKind::Return(Some(expr)) | FlowKind::Break(_, Some(expr)) => {
                 ctx.sema.type_of_expr(expr).map(TypeInfo::adjusted)
             }
             FlowKind::Try { .. } => {
@@ -841,8 +839,8 @@ impl FunctionBody {
                 cov_mark::hit!(external_control_flow_break_and_continue);
                 return None;
             }
-            (None, None, Some(b), None) => Some(FlowKind::Break(b.expr())),
-            (None, None, None, Some(_)) => Some(FlowKind::Continue),
+            (None, None, Some(b), None) => Some(FlowKind::Break(b.lifetime(), b.expr())),
+            (None, None, None, Some(c)) => Some(FlowKind::Continue(c.lifetime())),
             (None, None, None, None) => None,
         };
 
@@ -1144,12 +1142,12 @@ fn make_call(ctx: &AssistContext, fun: &Function, indent: IndentLevel) -> String
     match fun.outliving_locals.as_slice() {
         [] => {}
         [var] => {
-            format_to!(buf, "let {}{} = ", mut_modifier(var), var.local.name(ctx.db()).unwrap())
+            format_to!(buf, "let {}{} = ", mut_modifier(var), var.local.name(ctx.db()))
         }
         vars => {
             buf.push_str("let (");
             let bindings = vars.iter().format_with(", ", |local, f| {
-                f(&format_args!("{}{}", mut_modifier(local), local.local.name(ctx.db()).unwrap()))
+                f(&format_args!("{}{}", mut_modifier(local), local.local.name(ctx.db())))
             });
             format_to!(buf, "{}", bindings);
             buf.push_str(") = ");
@@ -1187,20 +1185,20 @@ impl FlowHandler {
                 let action = flow_kind.clone();
                 if *ret_ty == FunType::Unit {
                     match flow_kind {
-                        FlowKind::Return(None) | FlowKind::Break(None) | FlowKind::Continue => {
-                            FlowHandler::If { action }
-                        }
-                        FlowKind::Return(_) | FlowKind::Break(_) => {
+                        FlowKind::Return(None)
+                        | FlowKind::Break(_, None)
+                        | FlowKind::Continue(_) => FlowHandler::If { action },
+                        FlowKind::Return(_) | FlowKind::Break(_, _) => {
                             FlowHandler::IfOption { action }
                         }
                         FlowKind::Try { kind } => FlowHandler::Try { kind: kind.clone() },
                     }
                 } else {
                     match flow_kind {
-                        FlowKind::Return(None) | FlowKind::Break(None) | FlowKind::Continue => {
-                            FlowHandler::MatchOption { none: action }
-                        }
-                        FlowKind::Return(_) | FlowKind::Break(_) => {
+                        FlowKind::Return(None)
+                        | FlowKind::Break(_, None)
+                        | FlowKind::Continue(_) => FlowHandler::MatchOption { none: action },
+                        FlowKind::Return(_) | FlowKind::Break(_, _) => {
                             FlowHandler::MatchResult { err: action }
                         }
                         FlowKind::Try { kind } => FlowHandler::Try { kind: kind.clone() },
@@ -1219,28 +1217,26 @@ impl FlowHandler {
                 let stmt = make::expr_stmt(action);
                 let block = make::block_expr(iter::once(stmt.into()), None);
                 let controlflow_break_path = make::path_from_text("ControlFlow::Break");
-                let condition = make::condition(
+                let condition = make::expr_let(
+                    make::tuple_struct_pat(
+                        controlflow_break_path,
+                        iter::once(make::wildcard_pat().into()),
+                    )
+                    .into(),
                     call_expr,
-                    Some(
-                        make::tuple_struct_pat(
-                            controlflow_break_path,
-                            iter::once(make::wildcard_pat().into()),
-                        )
-                        .into(),
-                    ),
                 );
-                make::expr_if(condition, block, None)
+                make::expr_if(condition.into(), block, None)
             }
             FlowHandler::IfOption { action } => {
                 let path = make::ext::ident_path("Some");
                 let value_pat = make::ext::simple_ident_pat(make::name("value"));
                 let pattern = make::tuple_struct_pat(path, iter::once(value_pat.into()));
-                let cond = make::condition(call_expr, Some(pattern.into()));
+                let cond = make::expr_let(pattern.into(), call_expr);
                 let value = make::expr_path(make::ext::ident_path("value"));
                 let action_expr = action.make_result_handler(Some(value));
                 let action_stmt = make::expr_stmt(action_expr);
                 let then = make::block_expr(iter::once(action_stmt.into()), None);
-                make::expr_if(cond, then, None)
+                make::expr_if(cond.into(), then, None)
             }
             FlowHandler::MatchOption { none } => {
                 let some_name = "value";
@@ -1290,7 +1286,7 @@ impl FlowHandler {
 }
 
 fn path_expr_from_local(ctx: &AssistContext, var: Local) -> ast::Expr {
-    let name = var.name(ctx.db()).unwrap().to_string();
+    let name = var.name(ctx.db()).to_string();
     make::expr_path(make::ext::ident_path(&name))
 }
 
@@ -1452,7 +1448,7 @@ fn make_body(
                 .filter(|it| text_range.contains_range(it.text_range()))
                 .map(|it| match &it {
                     syntax::NodeOrToken::Node(n) => syntax::NodeOrToken::Node(
-                        rewrite_body_segment(ctx, &fun.params, &handler, &n),
+                        rewrite_body_segment(ctx, &fun.params, &handler, n),
                     ),
                     _ => it,
                 })
@@ -1522,7 +1518,7 @@ fn make_body(
                 make::expr_path(make::path_from_text("ControlFlow::Continue")),
                 make::arg_list(iter::once(make::expr_unit())),
             );
-            with_tail_expr(block, controlflow_continue.into())
+            with_tail_expr(block, controlflow_continue)
         }
         FlowHandler::IfOption { .. } => {
             let none = make::expr_path(make::ext::ident_path("None"));
@@ -3409,6 +3405,76 @@ fn $0fun_name(n: i32) -> ControlFlow<()> {
     }
 
     #[test]
+    fn break_loop_nested_labeled() {
+        check_assist(
+            extract_function,
+            r#"
+//- minicore: try
+fn foo() {
+    'bar: loop {
+        loop {
+            $0break 'bar;$0
+        }
+    }
+}
+"#,
+            r#"
+use core::ops::ControlFlow;
+
+fn foo() {
+    'bar: loop {
+        loop {
+            if let ControlFlow::Break(_) = fun_name() {
+                break 'bar;
+            }
+        }
+    }
+}
+
+fn $0fun_name() -> ControlFlow<()> {
+    return ControlFlow::Break(());
+    ControlFlow::Continue(())
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn continue_loop_nested_labeled() {
+        check_assist(
+            extract_function,
+            r#"
+//- minicore: try
+fn foo() {
+    'bar: loop {
+        loop {
+            $0continue 'bar;$0
+        }
+    }
+}
+"#,
+            r#"
+use core::ops::ControlFlow;
+
+fn foo() {
+    'bar: loop {
+        loop {
+            if let ControlFlow::Break(_) = fun_name() {
+                continue 'bar;
+            }
+        }
+    }
+}
+
+fn $0fun_name() -> ControlFlow<()> {
+    return ControlFlow::Break(());
+    ControlFlow::Continue(())
+}
+"#,
+        );
+    }
+
+    #[test]
     fn return_from_nested_loop() {
         check_assist(
             extract_function,
@@ -3604,6 +3670,46 @@ fn $0fun_name() -> Option<i32> {
     let k = 1;
     if k == 42 {
         return Some(3);
+    }
+    let m = k + 1;
+    None
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn break_with_value_and_label() {
+        check_assist(
+            extract_function,
+            r#"
+fn foo() -> i32 {
+    'bar: loop {
+        let n = 1;
+        $0let k = 1;
+        if k == 42 {
+            break 'bar 4;
+        }
+        let m = k + 1;$0
+        let h = 1;
+    }
+}
+"#,
+            r#"
+fn foo() -> i32 {
+    'bar: loop {
+        let n = 1;
+        if let Some(value) = fun_name() {
+            break 'bar value;
+        }
+        let h = 1;
+    }
+}
+
+fn $0fun_name() -> Option<i32> {
+    let k = 1;
+    if k == 42 {
+        return Some(4);
     }
     let m = k + 1;
     None

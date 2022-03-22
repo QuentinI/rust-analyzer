@@ -30,7 +30,14 @@ pub(crate) fn goto_definition(
     let file = sema.parse(position.file_id).syntax().clone();
     let original_token =
         pick_best_token(file.token_at_offset(position.offset), |kind| match kind {
-            IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate] | COMMENT => 2,
+            IDENT
+            | INT_NUMBER
+            | LIFETIME_IDENT
+            | T![self]
+            | T![super]
+            | T![crate]
+            | T![Self]
+            | COMMENT => 2,
             kind if kind.is_trivia() => 0,
             _ => 1,
         })?;
@@ -1237,6 +1244,7 @@ use mac::fn_macro;
 fn_macro$0!();
 
 //- /mac.rs crate:mac
+#![crate_type="proc-macro"]
 #[proc_macro]
 fn fn_macro() {}
  //^^^^^^^^

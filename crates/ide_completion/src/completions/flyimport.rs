@@ -1,6 +1,6 @@
 //! See [`import_on_the_fly`].
 use hir::ItemInNs;
-use ide_db::helpers::{
+use ide_db::imports::{
     import_assets::{ImportAssets, ImportCandidate, LocatedImport},
     insert_use::ImportScope,
 };
@@ -141,17 +141,20 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
         &ctx.sema,
     )?;
 
+    let path_kind = match ctx.path_kind() {
+        Some(kind) => Some(kind),
+        None if ctx.pattern_ctx.is_some() => Some(PathKind::Pat),
+        None => None,
+    };
     let ns_filter = |import: &LocatedImport| {
-        let kind = match ctx.path_kind() {
-            Some(kind) => kind,
-            None => {
-                return match import.original_item {
-                    ItemInNs::Macros(mac) => mac.is_fn_like(),
-                    _ => true,
-                }
-            }
+        let path_kind = match path_kind {
+            Some(path_kind) => path_kind,
+            None => match import.original_item {
+                ItemInNs::Macros(mac) => return mac.is_fn_like(ctx.db),
+                _ => return true,
+            },
         };
-        match (kind, import.original_item) {
+        match (path_kind, import.original_item) {
             // Aren't handled in flyimport
             (PathKind::Vis { .. } | PathKind::Use, _) => false,
             // modules are always fair game
@@ -160,7 +163,7 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
             (
                 PathKind::Expr | PathKind::Type | PathKind::Mac | PathKind::Pat,
                 ItemInNs::Macros(mac),
-            ) => mac.is_fn_like(),
+            ) => mac.is_fn_like(ctx.db),
             (PathKind::Mac, _) => true,
 
             (PathKind::Expr, ItemInNs::Types(_) | ItemInNs::Values(_)) => true,
@@ -171,8 +174,13 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
             (PathKind::Type, ItemInNs::Types(_)) => true,
             (PathKind::Type, ItemInNs::Values(_)) => false,
 
-            (PathKind::Attr { .. }, ItemInNs::Macros(mac)) => mac.is_attr(),
+            (PathKind::Attr { .. }, ItemInNs::Macros(mac)) => mac.is_attr(ctx.db),
             (PathKind::Attr { .. }, _) => false,
+
+            (PathKind::Derive, ItemInNs::Macros(mac)) => {
+                mac.is_derive(ctx.db) && !ctx.existing_derives.contains(&mac)
+            }
+            (PathKind::Derive, _) => false,
         }
     };
 
@@ -193,7 +201,7 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
             })
             .filter_map(|import| {
                 render_resolution_with_import(
-                    RenderContext::new(ctx, false),
+                    RenderContext::new(ctx),
                     ImportEdit { import, scope: import_scope.clone() },
                 )
             }),

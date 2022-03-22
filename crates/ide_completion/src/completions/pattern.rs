@@ -54,8 +54,7 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
     {
         if refutable || single_variant_enum(e) {
             super::enum_variants_with_paths(acc, ctx, e, |acc, ctx, variant, path| {
-                acc.add_qualified_variant_pat(ctx, variant, path.clone());
-                acc.add_qualified_enum_variant(ctx, variant, path);
+                acc.add_qualified_variant_pat(ctx, variant, path);
             });
         }
     }
@@ -63,7 +62,7 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
     // FIXME: ideally, we should look at the type we are matching against and
     // suggest variants + auto-imports
     ctx.process_all_names(&mut |name, res| {
-        let add_resolution = match res {
+        let add_simple_path = match res {
             hir::ScopeDef::ModuleDef(def) => match def {
                 hir::ModuleDef::Adt(hir::Adt::Struct(strukt)) => {
                     acc.add_struct_pat(ctx, strukt, Some(name.clone()));
@@ -76,22 +75,31 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
                     true
                 }
                 hir::ModuleDef::Adt(hir::Adt::Enum(e)) => refutable || single_variant_enum(e),
-                hir::ModuleDef::Const(..) | hir::ModuleDef::Module(..) => refutable,
+                hir::ModuleDef::Const(..) => refutable,
+                hir::ModuleDef::Module(..) => true,
+                hir::ModuleDef::Macro(mac) if mac.is_fn_like(ctx.db) => {
+                    return acc.add_macro(ctx, mac, name)
+                }
                 _ => false,
             },
-            hir::ScopeDef::MacroDef(mac) => mac.is_fn_like(),
             hir::ScopeDef::ImplSelfType(impl_) => match impl_.self_ty(ctx.db).as_adt() {
                 Some(hir::Adt::Struct(strukt)) => {
                     acc.add_struct_pat(ctx, strukt, Some(name.clone()));
                     true
                 }
-                Some(hir::Adt::Enum(_)) => refutable,
-                _ => true,
+                Some(hir::Adt::Enum(e)) => refutable || single_variant_enum(e),
+                Some(hir::Adt::Union(_)) => true,
+                _ => false,
             },
-            _ => false,
+            ScopeDef::GenericParam(hir::GenericParam::ConstParam(_)) => true,
+            ScopeDef::GenericParam(_)
+            | ScopeDef::AdtSelfType(_)
+            | ScopeDef::Local(_)
+            | ScopeDef::Label(_)
+            | ScopeDef::Unknown => false,
         };
-        if add_resolution {
-            acc.add_resolution(ctx, name, res);
+        if add_simple_path {
+            acc.add_resolution_simple(ctx, name, res);
         }
     });
 }
@@ -117,7 +125,9 @@ fn pattern_path_completion(
                     let module_scope = module.scope(ctx.db, ctx.module);
                     for (name, def) in module_scope {
                         let add_resolution = match def {
-                            ScopeDef::MacroDef(m) if m.is_fn_like() => true,
+                            ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => {
+                                mac.is_fn_like(ctx.db)
+                            }
                             ScopeDef::ModuleDef(_) => true,
                             _ => false,
                         };
@@ -127,46 +137,64 @@ fn pattern_path_completion(
                         }
                     }
                 }
-                hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Enum(e))) => {
-                    cov_mark::hit!(enum_plain_qualified_use_tree);
-                    e.variants(ctx.db)
-                        .into_iter()
-                        .for_each(|variant| acc.add_enum_variant(ctx, variant, None));
-                }
-                res @ (hir::PathResolution::TypeParam(_) | hir::PathResolution::SelfType(_)) => {
-                    if let Some(krate) = ctx.krate {
-                        let ty = match res {
-                            hir::PathResolution::TypeParam(param) => param.ty(ctx.db),
-                            hir::PathResolution::SelfType(impl_def) => impl_def.self_ty(ctx.db),
-                            _ => return,
-                        };
-
-                        if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
+                res @ (hir::PathResolution::TypeParam(_)
+                | hir::PathResolution::SelfType(_)
+                | hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Struct(_)))
+                | hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Enum(_)))
+                | hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Union(_)))
+                | hir::PathResolution::Def(hir::ModuleDef::BuiltinType(_))) => {
+                    let ty = match res {
+                        hir::PathResolution::TypeParam(param) => param.ty(ctx.db),
+                        hir::PathResolution::SelfType(impl_def) => impl_def.self_ty(ctx.db),
+                        hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Struct(s))) => {
+                            s.ty(ctx.db)
+                        }
+                        hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Enum(e))) => {
+                            cov_mark::hit!(enum_plain_qualified_use_tree);
                             e.variants(ctx.db)
                                 .into_iter()
                                 .for_each(|variant| acc.add_enum_variant(ctx, variant, None));
+                            e.ty(ctx.db)
                         }
+                        hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Union(u))) => {
+                            u.ty(ctx.db)
+                        }
+                        hir::PathResolution::Def(hir::ModuleDef::BuiltinType(ty)) => {
+                            let module = match ctx.module {
+                                Some(m) => m,
+                                None => return,
+                            };
+                            ty.ty(ctx.db, module)
+                        }
+                        _ => return,
+                    };
 
-                        let traits_in_scope = ctx.scope.visible_traits();
-                        let mut seen = FxHashSet::default();
-                        ty.iterate_path_candidates(
-                            ctx.db,
-                            krate,
-                            &traits_in_scope,
-                            ctx.module,
-                            None,
-                            |_ty, item| {
-                                // Note associated consts cannot be referenced in patterns
-                                if let AssocItem::TypeAlias(ta) = item {
+                    let traits_in_scope = ctx.scope.visible_traits();
+                    let mut seen = FxHashSet::default();
+                    ty.iterate_path_candidates(
+                        ctx.db,
+                        &ctx.scope,
+                        &traits_in_scope,
+                        ctx.module,
+                        None,
+                        |item| {
+                            match item {
+                                AssocItem::TypeAlias(ta) => {
                                     // We might iterate candidates of a trait multiple times here, so deduplicate them.
                                     if seen.insert(item) {
                                         acc.add_type_alias(ctx, ta);
                                     }
                                 }
-                                None::<()>
-                            },
-                        );
-                    }
+                                AssocItem::Const(c) => {
+                                    if seen.insert(item) {
+                                        acc.add_const(ctx, c);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            None::<()>
+                        },
+                    );
                 }
                 _ => {}
             }

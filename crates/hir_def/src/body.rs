@@ -13,12 +13,13 @@ use drop_bomb::DropBomb;
 use either::Either;
 use hir_expand::{
     ast_id_map::AstIdMap, hygiene::Hygiene, AstId, ExpandError, ExpandResult, HirFileId, InFile,
-    MacroCallId, MacroDefId,
+    MacroCallId,
 };
 use la_arena::{Arena, ArenaMap};
 use limit::Limit;
 use profile::Count;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use syntax::{ast, AstNode, AstPtr, SyntaxNodePtr};
 
 use crate::{
@@ -26,10 +27,11 @@ use crate::{
     db::DefDatabase,
     expr::{Expr, ExprId, Label, LabelId, Pat, PatId},
     item_scope::BuiltinShadowMode,
+    macro_id_to_def_id,
     nameres::DefMap,
     path::{ModPath, Path},
     src::HasSource,
-    AsMacroCall, BlockId, DefWithBodyId, HasModule, LocalModuleId, Lookup, ModuleId,
+    AsMacroCall, BlockId, DefWithBodyId, HasModule, LocalModuleId, Lookup, MacroId, ModuleId,
     UnresolvedMacro,
 };
 
@@ -97,15 +99,15 @@ impl Expander {
     ) -> Result<ExpandResult<Option<(Mark, T)>>, UnresolvedMacro> {
         if self.recursion_limit(db).check(self.recursion_limit + 1).is_err() {
             cov_mark::hit!(your_stack_belongs_to_me);
-            return Ok(ExpandResult::str_err(
+            return Ok(ExpandResult::only_err(ExpandError::Other(
                 "reached recursion limit during macro expansion".into(),
-            ));
+            )));
         }
 
         let macro_call = InFile::new(self.current_file_id, &macro_call);
 
         let resolver =
-            |path: ModPath| -> Option<MacroDefId> { self.resolve_path_as_macro(db, &path) };
+            |path| self.resolve_path_as_macro(db, &path).map(|it| macro_id_to_def_id(db, it));
 
         let mut err = None;
         let call_id =
@@ -151,7 +153,7 @@ impl Expander {
                 }
 
                 return ExpandResult::only_err(err.unwrap_or_else(|| {
-                    mbe::ExpandError::Other("failed to parse macro invocation".into())
+                    ExpandError::Other("failed to parse macro invocation".into())
                 }));
             }
         };
@@ -208,7 +210,7 @@ impl Expander {
         Path::from_src(path, &ctx)
     }
 
-    fn resolve_path_as_macro(&self, db: &dyn DefDatabase, path: &ModPath) -> Option<MacroDefId> {
+    fn resolve_path_as_macro(&self, db: &dyn DefDatabase, path: &ModPath) -> Option<MacroId> {
         self.def_map.resolve_path(db, self.module, path, BuiltinShadowMode::Other).0.take_macros()
     }
 
@@ -241,6 +243,7 @@ pub struct Mark {
 pub struct Body {
     pub exprs: Arena<Expr>,
     pub pats: Arena<Pat>,
+    pub or_pats: FxHashMap<PatId, Arc<[PatId]>>,
     pub labels: Arena<Label>,
     /// The patterns for the function's parameters. While the parameter types are
     /// part of the function signature, the patterns are not (they don't change
@@ -290,6 +293,10 @@ pub struct BodySourceMap {
     /// Instead, we use id of expression (`92`) to identify the field.
     field_map: FxHashMap<InFile<AstPtr<ast::RecordExprField>>, ExprId>,
     field_map_back: FxHashMap<ExprId, InFile<AstPtr<ast::RecordExprField>>>,
+
+    /// Maps a macro call to its lowered expressions, a single one if it expands to an expression,
+    /// or multiple if it expands to MacroStmts.
+    macro_call_to_exprs: FxHashMap<InFile<AstPtr<ast::MacroCall>>, SmallVec<[ExprId; 1]>>,
 
     expansions: FxHashMap<InFile<AstPtr<ast::MacroCall>>, HirFileId>,
 
@@ -352,7 +359,19 @@ impl Body {
     ) -> impl Iterator<Item = (BlockId, Arc<DefMap>)> + '_ {
         self.block_scopes
             .iter()
-            .map(move |block| (*block, db.block_def_map(*block).expect("block ID without DefMap")))
+            .map(move |&block| (block, db.block_def_map(block).expect("block ID without DefMap")))
+    }
+
+    pub fn pattern_representative(&self, pat: PatId) -> PatId {
+        self.or_pats.get(&pat).and_then(|pats| pats.first().copied()).unwrap_or(pat)
+    }
+
+    /// Retrieves all ident patterns this pattern shares the ident with.
+    pub fn ident_patterns_for<'slf>(&'slf self, pat: &'slf PatId) -> &'slf [PatId] {
+        match self.or_pats.get(pat) {
+            Some(pats) => &**pats,
+            None => std::slice::from_ref(pat),
+        }
     }
 
     fn new(
@@ -365,8 +384,9 @@ impl Body {
     }
 
     fn shrink_to_fit(&mut self) {
-        let Self { _c: _, body_expr: _, block_scopes, exprs, labels, params, pats } = self;
+        let Self { _c: _, body_expr: _, block_scopes, or_pats, exprs, labels, params, pats } = self;
         block_scopes.shrink_to_fit();
+        or_pats.shrink_to_fit();
         exprs.shrink_to_fit();
         labels.shrink_to_fit();
         params.shrink_to_fit();
@@ -406,12 +426,12 @@ impl BodySourceMap {
     }
 
     pub fn node_expr(&self, node: InFile<&ast::Expr>) -> Option<ExprId> {
-        let src = node.map(|it| AstPtr::new(it));
+        let src = node.map(AstPtr::new);
         self.expr_map.get(&src).cloned()
     }
 
     pub fn node_macro_file(&self, node: InFile<&ast::MacroCall>) -> Option<HirFileId> {
-        let src = node.map(|it| AstPtr::new(it));
+        let src = node.map(AstPtr::new);
         self.expansions.get(&src).cloned()
     }
 
@@ -434,7 +454,7 @@ impl BodySourceMap {
     }
 
     pub fn node_label(&self, node: InFile<&ast::Label>) -> Option<LabelId> {
-        let src = node.map(|it| AstPtr::new(it));
+        let src = node.map(AstPtr::new);
         self.label_map.get(&src).cloned()
     }
 
@@ -442,8 +462,13 @@ impl BodySourceMap {
         self.field_map_back[&expr].clone()
     }
     pub fn node_field(&self, node: InFile<&ast::RecordExprField>) -> Option<ExprId> {
-        let src = node.map(|it| AstPtr::new(it));
+        let src = node.map(AstPtr::new);
         self.field_map.get(&src).cloned()
+    }
+
+    pub fn macro_expansion_expr(&self, node: InFile<&ast::MacroCall>) -> Option<&[ExprId]> {
+        let src = node.map(AstPtr::new);
+        self.macro_call_to_exprs.get(&src).map(|it| &**it)
     }
 
     /// Get a reference to the body source map's diagnostics.

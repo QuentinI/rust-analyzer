@@ -14,10 +14,10 @@ mod snippet;
 use completions::flyimport::position_for_import;
 use ide_db::{
     base_db::FilePosition,
-    helpers::{
+    helpers::mod_path_to_ast,
+    imports::{
         import_assets::NameToImport,
         insert_use::{self, ImportScope},
-        mod_path_to_ast,
     },
     items_locator, RootDatabase,
 };
@@ -144,14 +144,9 @@ pub fn completions(
 ) -> Option<Completions> {
     let ctx = CompletionContext::new(db, position, config)?;
 
-    if ctx.no_completion_required() {
-        cov_mark::hit!(no_completion_required);
-        // No work required here.
-        return None;
-    }
-
     let mut acc = Completions::default();
     completions::attribute::complete_attribute(&mut acc, &ctx);
+    completions::attribute::complete_derive(&mut acc, &ctx);
     completions::attribute::complete_known_attribute_input(&mut acc, &ctx);
     completions::dot::complete_dot(&mut acc, &ctx);
     completions::extern_abi::complete_extern_abi(&mut acc, &ctx);

@@ -166,7 +166,7 @@ fn main() {
             kw true
             kw false
             kw return
-            sn Foo {…}              Foo { foo1: ${1:()}, foo2: ${2:()} }$0
+            st Foo {…}              Foo { foo1: u32, foo2: u32 }
             fd ..Default::default()
             fd foo1                 u32
             fd foo2                 u32
@@ -203,4 +203,40 @@ fn main() {
             fd foo2                   u32
         "#]],
     );
+}
+
+#[test]
+fn empty_union_literal() {
+    check(
+        r#"
+union Union { foo: u32, bar: f32 }
+
+fn foo() {
+    let other = Union {
+        $0
+    };
+}
+        "#,
+        expect![[r#"
+            fd foo u32
+            fd bar f32
+        "#]],
+    )
+}
+
+#[test]
+fn dont_suggest_additional_union_fields() {
+    check(
+        r#"
+union Union { foo: u32, bar: f32 }
+
+fn foo() {
+    let other = Union {
+        foo: 1,
+        $0
+    };
+}
+        "#,
+        expect![[r#""#]],
+    )
 }

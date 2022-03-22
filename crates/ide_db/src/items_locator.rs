@@ -13,7 +13,7 @@ use syntax::{ast, AstNode, SyntaxKind::NAME};
 
 use crate::{
     defs::{Definition, NameClass},
-    helpers::import_assets::NameToImport,
+    imports::import_assets::NameToImport,
     symbol_index, RootDatabase,
 };
 
@@ -115,7 +115,7 @@ fn find_items<'a>(
         });
 
     // Query the local crate using the symbol index.
-    let local_results = symbol_index::crate_symbols(db, krate.into(), local_query)
+    let local_results = symbol_index::crate_symbols(db, krate, local_query)
         .into_iter()
         .filter_map(move |local_candidate| get_name_definition(sema, &local_candidate))
         .filter_map(|name_definition_to_import| match name_definition_to_import {

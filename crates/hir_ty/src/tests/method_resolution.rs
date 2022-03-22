@@ -925,7 +925,6 @@ fn test() { S2.into(); }
 
 #[test]
 fn method_resolution_overloaded_method() {
-    cov_mark::check!(impl_self_type_match_without_receiver);
     check_types(
         r#"
 struct Wrapper<T>(T);
@@ -949,6 +948,33 @@ fn main() {
     let b = Wrapper::<Bar<f32>>::new(1.0);
     (a, b);
   //^^^^^^ (Wrapper<Foo<f32>>, Wrapper<Bar<f32>>)
+}
+"#,
+    );
+}
+
+#[test]
+fn method_resolution_overloaded_const() {
+    cov_mark::check!(const_candidate_self_type_mismatch);
+    check_types(
+        r#"
+struct Wrapper<T>(T);
+struct Foo<T>(T);
+struct Bar<T>(T);
+
+impl<T> Wrapper<Foo<T>> {
+    pub const VALUE: Foo<T>;
+}
+
+impl<T> Wrapper<Bar<T>> {
+    pub const VALUE: Bar<T>;
+}
+
+fn main() {
+    let a = Wrapper::<Foo<f32>>::VALUE;
+    let b = Wrapper::<Bar<f32>>::VALUE;
+    (a, b);
+  //^^^^^^ (Foo<f32>, Bar<f32>)
 }
 "#,
     );
@@ -1258,6 +1284,37 @@ mod b {
 }
 
 #[test]
+fn trait_vs_private_inherent_const() {
+    cov_mark::check!(const_candidate_not_visible);
+    check(
+        r#"
+mod a {
+    pub struct Foo;
+    impl Foo {
+        const VALUE: u32 = 2;
+    }
+    pub trait Trait {
+        const VALUE: usize;
+    }
+    impl Trait for Foo {
+        const VALUE: usize = 3;
+    }
+
+    fn foo() {
+        let x = Foo::VALUE;
+            //  ^^^^^^^^^^ type: u32
+    }
+}
+use a::Trait;
+fn foo() {
+    let x = a::Foo::VALUE;
+         // ^^^^^^^^^^^^^ type: usize
+}
+"#,
+    )
+}
+
+#[test]
 fn trait_impl_in_unnamed_const() {
     check_types(
         r#"
@@ -1359,7 +1416,69 @@ impl<T> [T] {
 fn f() {
     let v = [1, 2].map::<_, usize>(|x| -> x * 2);
     v;
-  //^ [usize; _]
+  //^ [usize; 2]
+}
+    "#,
+    );
+}
+
+#[test]
+fn resolve_const_generic_method() {
+    check_types(
+        r#"
+struct Const<const N: usize>;
+
+#[lang = "array"]
+impl<T, const N: usize> [T; N] {
+    pub fn my_map<F, U, const X: usize>(self, f: F, c: Const<X>) -> [U; X]
+    where
+        F: FnMut(T) -> U,
+    { loop {} }
+}
+
+#[lang = "slice"]
+impl<T> [T] {
+    pub fn my_map<F, const X: usize, U>(self, f: F, c: Const<X>) -> &[U]
+    where
+        F: FnMut(T) -> U,
+    { loop {} }
+}
+
+fn f<const C: usize, P>() {
+    let v = [1, 2].my_map::<_, (), 12>(|x| -> x * 2, Const::<12>);
+    v;
+  //^ [(); 12]
+    let v = [1, 2].my_map::<_, P, C>(|x| -> x * 2, Const::<C>);
+    v;
+  //^ [P; C]
+}
+    "#,
+    );
+}
+
+#[test]
+fn const_generic_type_alias() {
+    check_types(
+        r#"
+struct Const<const N: usize>;
+type U2 = Const<2>;
+type U5 = Const<5>;
+
+impl U2 {
+    fn f(self) -> Const<12> {
+        loop {}
+    }
+}
+
+impl U5 {
+    fn f(self) -> Const<15> {
+        loop {}
+    }
+}
+
+fn f(x: U2) {
+    let y = x.f();
+      //^ Const<12>
 }
     "#,
     );
@@ -1458,5 +1577,123 @@ fn main() {
      // ^^^^^^^ bool
 }
     "#,
+    );
+}
+
+#[test]
+fn deref_fun_1() {
+    check_types(
+        r#"
+//- minicore: deref
+
+struct A<T, U>(T, U);
+struct B<T>(T);
+struct C<T>(T);
+
+impl<T> core::ops::Deref for A<B<T>, u32> {
+    type Target = B<T>;
+    fn deref(&self) -> &B<T> { &self.0 }
+}
+impl core::ops::Deref for B<isize> {
+    type Target = C<isize>;
+    fn deref(&self) -> &C<isize> { loop {} }
+}
+
+impl<T: Copy> C<T> {
+    fn thing(&self) -> T { self.0 }
+}
+
+fn make<T>() -> T { loop {} }
+
+fn test() {
+    let a1 = A(make(), make());
+    let _: usize = (*a1).0;
+    a1;
+  //^^ A<B<usize>, u32>
+
+    let a2 = A(make(), make());
+    a2.thing();
+  //^^^^^^^^^^ isize
+    a2;
+  //^^ A<B<isize>, u32>
+}
+"#,
+    );
+}
+
+#[test]
+fn deref_fun_2() {
+    check_types(
+        r#"
+//- minicore: deref
+
+struct A<T, U>(T, U);
+struct B<T>(T);
+struct C<T>(T);
+
+impl<T> core::ops::Deref for A<B<T>, u32> {
+    type Target = B<T>;
+    fn deref(&self) -> &B<T> { &self.0 }
+}
+impl core::ops::Deref for B<isize> {
+    type Target = C<isize>;
+    fn deref(&self) -> &C<isize> { loop {} }
+}
+
+impl<T> core::ops::Deref for A<C<T>, i32> {
+    type Target = C<T>;
+    fn deref(&self) -> &C<T> { &self.0 }
+}
+
+impl<T: Copy> C<T> {
+    fn thing(&self) -> T { self.0 }
+}
+
+fn make<T>() -> T { loop {} }
+
+fn test() {
+    let a1 = A(make(), 1u32);
+    a1.thing();
+    a1;
+  //^^ A<B<isize>, u32>
+
+    let a2 = A(make(), 1i32);
+    let _: &str = a2.thing();
+    a2;
+  //^^ A<C<&str>, i32>
+}
+"#,
+    );
+}
+
+#[test]
+fn receiver_adjustment_autoref() {
+    check(
+        r#"
+struct Foo;
+impl Foo {
+    fn foo(&self) {}
+}
+fn test() {
+    Foo.foo();
+  //^^^ adjustments: Borrow(Ref(Not))
+    (&Foo).foo();
+  // ^^^^ adjustments: ,
+}
+"#,
+    );
+}
+
+#[test]
+fn receiver_adjustment_unsize_array() {
+    // FIXME not quite correct
+    check(
+        r#"
+//- minicore: slice
+fn test() {
+    let a = [1, 2, 3];
+    a.len();
+} //^ adjustments: Pointer(Unsize), Borrow(Ref(Not))
+"#,
     );
 }

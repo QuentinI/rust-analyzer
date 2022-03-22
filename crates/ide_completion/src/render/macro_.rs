@@ -1,34 +1,24 @@
 //! Renderer for macro invocations.
 
-use either::Either;
-use hir::{Documentation, HasSource, InFile, Semantics};
-use ide_db::{RootDatabase, SymbolKind};
-use syntax::{
-    display::{fn_as_proc_macro_label, macro_label},
-    SmolStr,
-};
+use hir::{Documentation, HirDisplay};
+use ide_db::SymbolKind;
+use syntax::SmolStr;
 
-use crate::{
-    context::PathKind,
-    item::{CompletionItem, ImportEdit},
-    render::RenderContext,
-};
+use crate::{context::PathKind, item::CompletionItem, render::RenderContext};
 
 pub(crate) fn render_macro(
     ctx: RenderContext<'_>,
-    import_to_add: Option<ImportEdit>,
     name: hir::Name,
-    macro_: hir::MacroDef,
+    macro_: hir::Macro,
 ) -> CompletionItem {
     let _p = profile::span("render_macro");
-    render(ctx, name, macro_, import_to_add)
+    render(ctx, name, macro_)
 }
 
 fn render(
     ctx @ RenderContext { completion, .. }: RenderContext<'_>,
     name: hir::Name,
-    macro_: hir::MacroDef,
-    import_to_add: Option<ImportEdit>,
+    macro_: hir::Macro,
 ) -> CompletionItem {
     let source_range = if completion.is_immediately_after_macro_bang() {
         cov_mark::hit!(completes_macro_call_if_cursor_at_bang_token);
@@ -40,28 +30,23 @@ fn render(
     let name = name.to_smol_str();
     let docs = ctx.docs(macro_);
     let docs_str = docs.as_ref().map(Documentation::as_str).unwrap_or_default();
-    let (bra, ket) =
-        if macro_.is_fn_like() { guess_macro_braces(&name, docs_str) } else { ("", "") };
+    let is_fn_like = macro_.is_fn_like(completion.db);
+    let (bra, ket) = if is_fn_like { guess_macro_braces(&name, docs_str) } else { ("", "") };
 
-    let needs_bang = macro_.is_fn_like()
-        && !matches!(completion.path_kind(), Some(PathKind::Mac | PathKind::Use));
+    let needs_bang =
+        is_fn_like && !matches!(completion.path_kind(), Some(PathKind::Mac | PathKind::Use));
 
     let mut item = CompletionItem::new(
-        SymbolKind::from(macro_.kind()),
+        SymbolKind::from(macro_.kind(completion.db)),
         source_range,
         label(&ctx, needs_bang, bra, ket, &name),
     );
     item.set_deprecated(ctx.is_deprecated(macro_))
-        .set_detail(detail(&completion.sema, macro_))
+        .detail(macro_.display(completion.db).to_string())
         .set_documentation(docs)
         .set_relevance(ctx.completion_relevance());
 
-    if let Some(import_to_add) = import_to_add {
-        item.add_import(import_to_add);
-    }
-
     let name = &*name;
-
     match ctx.snippet_cap() {
         Some(cap) if needs_bang && !completion.path_is_call() => {
             let snippet = format!("{}!{}$0{}", name, bra, ket);
@@ -77,6 +62,9 @@ fn render(
             item.insert_text(name);
         }
     };
+    if let Some(import_to_add) = ctx.import_to_add {
+        item.add_import(import_to_add);
+    }
 
     item.build()
 }
@@ -101,17 +89,6 @@ fn label(
 
 fn banged_name(name: &str) -> SmolStr {
     SmolStr::from_iter([name, "!"])
-}
-
-fn detail(sema: &Semantics<RootDatabase>, macro_: hir::MacroDef) -> Option<String> {
-    // FIXME: This is parsing the file!
-    let InFile { file_id, value } = macro_.source(sema.db)?;
-    let _ = sema.parse_or_expand(file_id);
-    let detail = match value {
-        Either::Left(node) => macro_label(&node),
-        Either::Right(node) => fn_as_proc_macro_label(&node),
-    };
-    Some(detail)
 }
 
 fn guess_macro_braces(macro_name: &str, docs: &str) -> (&'static str, &'static str) {

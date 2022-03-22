@@ -10,11 +10,11 @@ use hir_def::{
     body,
     db::DefDatabase,
     find_path,
-    generics::TypeParamProvenance,
+    generics::{TypeOrConstParamData, TypeParamProvenance},
     intern::{Internable, Interned},
     item_scope::ItemInNs,
     path::{Path, PathKind},
-    type_ref::{TraitBoundModifier, TypeBound, TypeRef},
+    type_ref::{ConstScalar, TraitBoundModifier, TypeBound, TypeRef},
     visibility::Visibility,
     HasModule, ItemContainerId, Lookup, ModuleId, TraitId,
 };
@@ -23,16 +23,15 @@ use itertools::Itertools;
 use syntax::SmolStr;
 
 use crate::{
-    const_from_placeholder_idx,
     db::HirDatabase,
     from_assoc_type_id, from_foreign_def_id, from_placeholder_idx, lt_from_placeholder_idx,
     mapping::from_chalk,
     primitive, subst_prefix, to_assoc_type_id,
     utils::{self, generics},
-    AdtId, AliasEq, AliasTy, CallableDefId, CallableSig, Const, ConstValue, DomainGoal, GenericArg,
-    ImplTraitId, Interner, Lifetime, LifetimeData, LifetimeOutlives, Mutability, OpaqueTy,
-    ProjectionTy, ProjectionTyExt, QuantifiedWhereClause, Scalar, TraitRef, TraitRefExt, Ty, TyExt,
-    TyKind, WhereClause,
+    AdtId, AliasEq, AliasTy, Binders, CallableDefId, CallableSig, Const, ConstValue, DomainGoal,
+    GenericArg, ImplTraitId, Interner, Lifetime, LifetimeData, LifetimeOutlives, Mutability,
+    OpaqueTy, ProjectionTy, ProjectionTyExt, QuantifiedWhereClause, Scalar, Substitution, TraitRef,
+    TraitRefExt, Ty, TyExt, TyKind, WhereClause,
 };
 
 pub struct HirFormatter<'a> {
@@ -317,12 +316,12 @@ impl HirDisplay for Const {
         let data = self.interned();
         match data.value {
             ConstValue::BoundVar(idx) => idx.hir_fmt(f),
-            ConstValue::InferenceVar(..) => write!(f, "_"),
+            ConstValue::InferenceVar(..) => write!(f, "#c#"),
             ConstValue::Placeholder(idx) => {
-                let id = const_from_placeholder_idx(f.db, idx);
+                let id = from_placeholder_idx(f.db, idx);
                 let generics = generics(f.db.upcast(), id.parent);
-                let param_data = &generics.params.consts[id.local_id];
-                write!(f, "{}", param_data.name)
+                let param_data = &generics.params.type_or_consts[id.local_id];
+                write!(f, "{}", param_data.name().unwrap())
             }
             ConstValue::Concrete(c) => write!(f, "{}", c.interned),
         }
@@ -490,9 +489,9 @@ impl HirDisplay for Ty {
                 };
                 if parameters.len(Interner) > 0 {
                     let generics = generics(f.db.upcast(), def.into());
-                    let (parent_params, self_param, type_params, _impl_trait_params) =
+                    let (parent_params, self_param, type_params, const_params, _impl_trait_params) =
                         generics.provenance_split();
-                    let total_len = parent_params + self_param + type_params;
+                    let total_len = parent_params + self_param + type_params + const_params;
                     // We print all params except implicit impl Trait params. Still a bit weird; should we leave out parent and self?
                     if total_len > 0 {
                         write!(f, "<")?;
@@ -545,24 +544,37 @@ impl HirDisplay for Ty {
                         {
                             None => parameters.as_slice(Interner),
                             Some(default_parameters) => {
+                                fn should_show(
+                                    parameter: &GenericArg,
+                                    default_parameters: &[Binders<GenericArg>],
+                                    i: usize,
+                                    parameters: &Substitution,
+                                ) -> bool {
+                                    if parameter.ty(Interner).map(|x| x.kind(Interner))
+                                        == Some(&TyKind::Error)
+                                    {
+                                        return true;
+                                    }
+                                    if let Some(ConstValue::Concrete(c)) =
+                                        parameter.constant(Interner).map(|x| x.data(Interner).value)
+                                    {
+                                        if c.interned == ConstScalar::Unknown {
+                                            return true;
+                                        }
+                                    }
+                                    let default_parameter = match default_parameters.get(i) {
+                                        Some(x) => x,
+                                        None => return true,
+                                    };
+                                    let actual_default = default_parameter
+                                        .clone()
+                                        .substitute(Interner, &subst_prefix(parameters, i));
+                                    parameter != &actual_default
+                                }
                                 let mut default_from = 0;
                                 for (i, parameter) in parameters.iter(Interner).enumerate() {
-                                    match (
-                                        parameter.assert_ty_ref(Interner).kind(Interner),
-                                        default_parameters.get(i),
-                                    ) {
-                                        (&TyKind::Error, _) | (_, None) => {
-                                            default_from = i + 1;
-                                        }
-                                        (_, Some(default_parameter)) => {
-                                            let actual_default = default_parameter
-                                                .clone()
-                                                .substitute(Interner, &subst_prefix(parameters, i));
-                                            if parameter.assert_ty_ref(Interner) != &actual_default
-                                            {
-                                                default_from = i + 1;
-                                            }
-                                        }
+                                    if should_show(parameter, &default_parameters, i, parameters) {
+                                        default_from = i + 1;
                                     }
                                 }
                                 &parameters.as_slice(Interner)[0..default_from]
@@ -681,35 +693,40 @@ impl HirDisplay for Ty {
             TyKind::Placeholder(idx) => {
                 let id = from_placeholder_idx(f.db, *idx);
                 let generics = generics(f.db.upcast(), id.parent);
-                let param_data = &generics.params.types[id.local_id];
-                match param_data.provenance {
-                    TypeParamProvenance::TypeParamList | TypeParamProvenance::TraitSelf => {
-                        write!(f, "{}", param_data.name.clone().unwrap_or_else(Name::missing))?
-                    }
-                    TypeParamProvenance::ArgumentImplTrait => {
-                        let substs = generics.type_params_subst(f.db);
-                        let bounds =
-                            f.db.generic_predicates(id.parent)
-                                .iter()
-                                .map(|pred| pred.clone().substitute(Interner, &substs))
-                                .filter(|wc| match &wc.skip_binders() {
-                                    WhereClause::Implemented(tr) => {
-                                        &tr.self_type_parameter(Interner) == self
-                                    }
-                                    WhereClause::AliasEq(AliasEq {
-                                        alias: AliasTy::Projection(proj),
-                                        ty: _,
-                                    }) => &proj.self_type_parameter(Interner) == self,
-                                    _ => false,
-                                })
-                                .collect::<Vec<_>>();
-                        let krate = id.parent.module(f.db.upcast()).krate();
-                        write_bounds_like_dyn_trait_with_prefix(
-                            "impl",
-                            &bounds,
-                            SizedByDefault::Sized { anchor: krate },
-                            f,
-                        )?;
+                let param_data = &generics.params.type_or_consts[id.local_id];
+                match param_data {
+                    TypeOrConstParamData::TypeParamData(p) => match p.provenance {
+                        TypeParamProvenance::TypeParamList | TypeParamProvenance::TraitSelf => {
+                            write!(f, "{}", p.name.clone().unwrap_or_else(Name::missing))?
+                        }
+                        TypeParamProvenance::ArgumentImplTrait => {
+                            let substs = generics.placeholder_subst(f.db);
+                            let bounds =
+                                f.db.generic_predicates(id.parent)
+                                    .iter()
+                                    .map(|pred| pred.clone().substitute(Interner, &substs))
+                                    .filter(|wc| match &wc.skip_binders() {
+                                        WhereClause::Implemented(tr) => {
+                                            &tr.self_type_parameter(Interner) == self
+                                        }
+                                        WhereClause::AliasEq(AliasEq {
+                                            alias: AliasTy::Projection(proj),
+                                            ty: _,
+                                        }) => &proj.self_type_parameter(Interner) == self,
+                                        _ => false,
+                                    })
+                                    .collect::<Vec<_>>();
+                            let krate = id.parent.module(f.db.upcast()).krate();
+                            write_bounds_like_dyn_trait_with_prefix(
+                                "impl",
+                                &bounds,
+                                SizedByDefault::Sized { anchor: krate },
+                                f,
+                            )?;
+                        }
+                    },
+                    TypeOrConstParamData::ConstParamData(p) => {
+                        write!(f, "{}", p.name)?;
                     }
                 }
             }
@@ -1094,20 +1111,32 @@ impl HirDisplay for TypeRef {
                 inner.hir_fmt(f)?;
                 write!(f, "]")?;
             }
-            TypeRef::Fn(tys, is_varargs) => {
+            TypeRef::Fn(parameters, is_varargs) => {
                 // FIXME: Function pointer qualifiers.
                 write!(f, "fn(")?;
-                f.write_joined(&tys[..tys.len() - 1], ", ")?;
-                if *is_varargs {
-                    write!(f, "{}...", if tys.len() == 1 { "" } else { ", " })?;
-                }
-                write!(f, ")")?;
-                let ret_ty = tys.last().unwrap();
-                match ret_ty {
-                    TypeRef::Tuple(tup) if tup.is_empty() => {}
-                    _ => {
-                        write!(f, " -> ")?;
-                        ret_ty.hir_fmt(f)?;
+                if let Some(((_, return_type), function_parameters)) = parameters.split_last() {
+                    for index in 0..function_parameters.len() {
+                        let (param_name, param_type) = &function_parameters[index];
+                        if let Some(name) = param_name {
+                            write!(f, "{}: ", name)?;
+                        }
+
+                        param_type.hir_fmt(f)?;
+
+                        if index != function_parameters.len() - 1 {
+                            write!(f, ", ")?;
+                        }
+                    }
+                    if *is_varargs {
+                        write!(f, "{}...", if parameters.len() == 1 { "" } else { ", " })?;
+                    }
+                    write!(f, ")")?;
+                    match &return_type {
+                        TypeRef::Tuple(tup) if tup.is_empty() => {}
+                        _ => {
+                            write!(f, " -> ")?;
+                            return_type.hir_fmt(f)?;
+                        }
                     }
                 }
             }
@@ -1177,7 +1206,18 @@ impl HirDisplay for Path {
                     write!(f, "super")?;
                 }
             }
-            (_, PathKind::DollarCrate(_)) => write!(f, "{{extern_crate}}")?,
+            (_, PathKind::DollarCrate(id)) => {
+                // Resolve `$crate` to the crate's display name.
+                // FIXME: should use the dependency name instead if available, but that depends on
+                // the crate invoking `HirDisplay`
+                let crate_graph = f.db.crate_graph();
+                let name = crate_graph[*id]
+                    .display_name
+                    .as_ref()
+                    .map(|name| name.canonical_name())
+                    .unwrap_or("$crate");
+                write!(f, "{name}")?
+            }
         }
 
         for (seg_idx, segment) in self.segments().iter().enumerate() {
@@ -1254,6 +1294,7 @@ impl HirDisplay for hir_def::path::GenericArg {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
         match self {
             hir_def::path::GenericArg::Type(ty) => ty.hir_fmt(f),
+            hir_def::path::GenericArg::Const(c) => write!(f, "{}", c),
             hir_def::path::GenericArg::Lifetime(lifetime) => write!(f, "{}", lifetime.name),
         }
     }

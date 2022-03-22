@@ -10,7 +10,8 @@ use hir::{HasSource, Semantics};
 use ide_db::{
     base_db::FileRange,
     defs::{Definition, IdentClass},
-    helpers::{pick_best_token, FamousDefs},
+    famous_defs::FamousDefs,
+    helpers::pick_best_token,
     FxIndexSet, RootDatabase,
 };
 use itertools::Itertools;
@@ -94,14 +95,13 @@ pub(crate) fn hover(
     let sema = &hir::Semantics::new(db);
     let file = sema.parse(file_id).syntax().clone();
 
-    let offset = if !range.is_empty() {
+    if !range.is_empty() {
         return hover_ranged(&file, range, sema, config);
-    } else {
-        range.start()
-    };
+    }
+    let offset = range.start();
 
     let original_token = pick_best_token(file.token_at_offset(offset), |kind| match kind {
-        IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate] => 3,
+        IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate] | T![Self] => 3,
         T!['('] | T![')'] => 2,
         kind if kind.is_trivia() => 0,
         _ => 1,
@@ -118,10 +118,11 @@ pub(crate) fn hover(
     let descended = sema.descend_into_macros(original_token.clone());
 
     // FIXME: Definition should include known lints and the like instead of having this special case here
-    if let Some(res) = descended.iter().find_map(|token| {
+    let hovered_lint = descended.iter().find_map(|token| {
         let attr = token.ancestors().find_map(ast::Attr::cast)?;
         render::try_for_lint(&attr, token)
-    }) {
+    });
+    if let Some(res) = hovered_lint {
         return Some(RangeInfo::new(original_token.text_range(), res));
     }
 
@@ -143,7 +144,9 @@ pub(crate) fn hover(
 
     if result.is_none() {
         // fallbacks, show keywords or types
-        if let Some(res) = render::keyword(sema, config, &original_token) {
+
+        let res = descended.iter().find_map(|token| render::keyword(sema, config, token));
+        if let Some(res) = res {
             return Some(RangeInfo::new(original_token.text_range(), res));
         }
         let res = descended
@@ -199,6 +202,7 @@ fn hover_ranged(
     sema: &Semantics<RootDatabase>,
     config: &HoverConfig,
 ) -> Option<RangeInfo<HoverResult>> {
+    // FIXME: make this work in attributes
     let expr_or_pat = file.covering_element(range).ancestors().find_map(|it| {
         match_ast! {
             match it {

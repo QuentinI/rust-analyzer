@@ -11,11 +11,11 @@ use syntax::{
     ast::{self, HasArgList, HasLoopBody},
     match_ast, AstNode, Direction, SyntaxElement,
     SyntaxKind::*,
-    SyntaxNode, SyntaxToken, TextRange, TextSize, T,
+    SyntaxNode, SyntaxToken, TextRange, TextSize,
 };
 
 #[cfg(test)]
-use crate::tests::{check_pattern_is_applicable, check_pattern_is_not_applicable};
+use crate::tests::check_pattern_is_applicable;
 
 /// Immediate previous node to what we are completing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -291,41 +291,41 @@ fn find_node_with_range<N: AstNode>(syntax: &SyntaxNode, range: TextRange) -> Op
     syntax.covering_element(range).ancestors().find_map(N::cast)
 }
 
-pub(crate) fn inside_impl_trait_block(element: SyntaxElement) -> bool {
-    // Here we search `impl` keyword up through the all ancestors, unlike in `has_impl_parent`,
-    // where we only check the first parent with different text range.
-    element
-        .ancestors()
-        .find(|it| it.kind() == IMPL)
-        .map(|it| ast::Impl::cast(it).unwrap())
-        .map(|it| it.trait_().is_some())
-        .unwrap_or(false)
-}
-#[test]
-fn test_inside_impl_trait_block() {
-    check_pattern_is_applicable(r"impl Foo for Bar { f$0 }", inside_impl_trait_block);
-    check_pattern_is_applicable(r"impl Foo for Bar { fn f$0 }", inside_impl_trait_block);
-    check_pattern_is_not_applicable(r"impl A { f$0 }", inside_impl_trait_block);
-    check_pattern_is_not_applicable(r"impl A { fn f$0 }", inside_impl_trait_block);
-}
-
 pub(crate) fn previous_token(element: SyntaxElement) -> Option<SyntaxToken> {
     element.into_token().and_then(previous_non_trivia_token)
 }
 
-/// Check if the token previous to the previous one is `for`.
-/// For example, `for _ i$0` => true.
-pub(crate) fn for_is_prev2(element: SyntaxElement) -> bool {
-    element
-        .into_token()
-        .and_then(previous_non_trivia_token)
-        .and_then(previous_non_trivia_token)
-        .filter(|it| it.kind() == T![for])
-        .is_some()
+pub(crate) fn is_in_token_of_for_loop(element: SyntaxElement) -> bool {
+    // oh my ...
+    (|| {
+        let syntax_token = element.into_token()?;
+        let range = syntax_token.text_range();
+        let for_expr = syntax_token.ancestors().find_map(ast::ForExpr::cast)?;
+
+        // check if the current token is the `in` token of a for loop
+        if let Some(token) = for_expr.in_token() {
+            return Some(syntax_token == token);
+        }
+        let pat = for_expr.pat()?;
+        if range.end() < pat.syntax().text_range().end() {
+            // if we are inside or before the pattern we can't be at the `in` token position
+            return None;
+        }
+        let next_sibl = next_non_trivia_sibling(pat.syntax().clone().into())?;
+        Some(match next_sibl {
+            // the loop body is some node, if our token is at the start we are at the `in` position,
+            // otherwise we could be in a recovered expression, we don't wanna ruin completions there
+            syntax::NodeOrToken::Node(n) => n.text_range().start() == range.start(),
+            // the loop body consists of a single token, if we are this we are certainly at the `in` token position
+            syntax::NodeOrToken::Token(t) => t == syntax_token,
+        })
+    })()
+    .unwrap_or(false)
 }
+
 #[test]
 fn test_for_is_prev2() {
-    check_pattern_is_applicable(r"for i i$0", for_is_prev2);
+    check_pattern_is_applicable(r"fn __() { for i i$0 }", is_in_token_of_for_loop);
 }
 
 pub(crate) fn is_in_loop_body(node: &SyntaxNode) -> bool {
@@ -347,11 +347,23 @@ pub(crate) fn is_in_loop_body(node: &SyntaxNode) -> bool {
 
 fn previous_non_trivia_token(token: SyntaxToken) -> Option<SyntaxToken> {
     let mut token = token.prev_token();
-    while let Some(inner) = token.clone() {
+    while let Some(inner) = token {
         if !inner.kind().is_trivia() {
             return Some(inner);
         } else {
             token = inner.prev_token();
+        }
+    }
+    None
+}
+
+fn next_non_trivia_sibling(ele: SyntaxElement) -> Option<SyntaxElement> {
+    let mut e = ele.next_sibling_or_token();
+    while let Some(inner) = e {
+        if !inner.kind().is_trivia() {
+            return Some(inner);
+        } else {
+            e = inner.next_sibling_or_token();
         }
     }
     None

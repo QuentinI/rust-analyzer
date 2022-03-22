@@ -120,8 +120,7 @@ fn library_symbols(db: &dyn SymbolsDatabase, source_root_id: SourceRootId) -> Ar
         // we specifically avoid calling SymbolsDatabase::module_symbols here, even they do the same thing,
         // as the index for a library is not going to really ever change, and we do not want to store each
         // module's index in salsa.
-        .map(|module| SymbolCollector::collect(db.upcast(), module))
-        .flatten()
+        .flat_map(|module| SymbolCollector::collect(db.upcast(), module))
         .collect();
 
     Arc::new(SymbolIndex::new(symbols))
@@ -425,7 +424,11 @@ struct StructInModB;
         let symbols: Vec<_> = Crate::from(db.test_crate())
             .modules(&db)
             .into_iter()
-            .map(|module_id| (module_id, SymbolCollector::collect(&db, module_id)))
+            .map(|module_id| {
+                let mut symbols = SymbolCollector::collect(&db, module_id);
+                symbols.sort_by_key(|it| it.name.clone());
+                (module_id, symbols)
+            })
             .collect();
 
         expect_file!["./test_data/test_symbol_index_collection.txt"].assert_debug_eq(&symbols);

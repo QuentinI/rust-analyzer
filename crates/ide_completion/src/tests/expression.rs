@@ -30,7 +30,7 @@ fn baz() {
 }
             "#,
         // This should not contain `FooDesc {…}`.
-        expect![[r##"
+        expect![[r#"
             kw unsafe
             kw match
             kw while
@@ -57,13 +57,13 @@ fn baz() {
             fn baz()         fn()
             st Unit
             md _69latrick
-            ma makro!(…)     #[macro_export] macro_rules! makro
+            ma makro!(…)     macro_rules! makro
             fn function()    fn()
             sc STATIC
             un Union
-            ev TupleV(…)     (u32)
+            ev TupleV(…)     TupleV(u32)
             ct CONST
-        "##]],
+        "#]],
     )
 }
 
@@ -125,7 +125,7 @@ impl Unit {
 }
 "#,
         // `self` is in here twice, once as the module, once as the local
-        expect![[r##"
+        expect![[r#"
             me self.foo()   fn(self)
             kw unsafe
             kw fn
@@ -166,14 +166,14 @@ impl Unit {
             md module
             st Unit
             md qualified
-            ma makro!(…)    #[macro_export] macro_rules! makro
+            ma makro!(…)    macro_rules! makro
             ?? Unresolved
             fn function()   fn()
             sc STATIC
             un Union
-            ev TupleV(…)    (u32)
+            ev TupleV(…)    TupleV(u32)
             ct CONST
-        "##]],
+        "#]],
     );
     check(
         r#"
@@ -187,7 +187,7 @@ impl Unit {
     }
 }
 "#,
-        expect![[r##"
+        expect![[r#"
             tt Trait
             en Enum
             st Record
@@ -195,14 +195,14 @@ impl Unit {
             md module
             st Unit
             md qualified
-            ma makro!(…)  #[macro_export] macro_rules! makro
+            ma makro!(…)  macro_rules! makro
             ?? Unresolved
             fn function() fn()
             sc STATIC
             un Union
-            ev TupleV(…)  (u32)
+            ev TupleV(…)  TupleV(u32)
             ct CONST
-        "##]],
+        "#]],
     );
 }
 
@@ -543,12 +543,33 @@ fn func() {
 }
 "#,
         expect![[r#"
-            ev TupleV(…)   (u32)
-            ev RecordV     {field: u32}
-            ev UnitV       ()
+            ev TupleV(…)   TupleV(u32)
+            ev RecordV {…} RecordV { field: u32 }
+            ev UnitV       UnitV
             ct ASSOC_CONST const ASSOC_CONST: ()
             fn assoc_fn()  fn()
             ta AssocType   type AssocType = ()
+        "#]],
+    );
+}
+
+#[test]
+fn with_parens() {
+    check_empty(
+        r#"
+enum Enum {
+    Variant()
+}
+impl Enum {
+    fn variant() -> Self { Enum::Variant() }
+}
+fn func() {
+    Enum::$0()
+}
+"#,
+        expect![[r#"
+            ev Variant(…) Variant
+            fn variant    fn() -> Enum
         "#]],
     );
 }

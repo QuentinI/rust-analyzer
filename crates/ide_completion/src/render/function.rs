@@ -1,59 +1,54 @@
 //! Renderer for function calls.
 
 use hir::{db::HirDatabase, AsAssocItem, HirDisplay};
-use ide_db::SymbolKind;
+use ide_db::{SnippetCap, SymbolKind};
 use itertools::Itertools;
 use stdx::format_to;
+use syntax::SmolStr;
 
 use crate::{
-    context::CompletionContext,
-    item::{CompletionItem, CompletionItemKind, CompletionRelevance, ImportEdit},
-    render::{
-        builder_ext::Params, compute_exact_name_match, compute_ref_match, compute_type_match,
-        RenderContext,
-    },
+    context::{CompletionContext, PathCompletionCtx, PathKind},
+    item::{Builder, CompletionItem, CompletionItemKind, CompletionRelevance},
+    patterns::ImmediateLocation,
+    render::{compute_exact_name_match, compute_ref_match, compute_type_match, RenderContext},
 };
 
-enum FuncType {
+enum FuncKind {
     Function,
     Method(Option<hir::Name>),
 }
 
 pub(crate) fn render_fn(
     ctx: RenderContext<'_>,
-    import_to_add: Option<ImportEdit>,
     local_name: Option<hir::Name>,
     func: hir::Function,
 ) -> CompletionItem {
     let _p = profile::span("render_fn");
-    render(ctx, local_name, func, FuncType::Function, import_to_add)
+    render(ctx, local_name, func, FuncKind::Function)
 }
 
 pub(crate) fn render_method(
     ctx: RenderContext<'_>,
-    import_to_add: Option<ImportEdit>,
     receiver: Option<hir::Name>,
     local_name: Option<hir::Name>,
     func: hir::Function,
 ) -> CompletionItem {
     let _p = profile::span("render_method");
-    render(ctx, local_name, func, FuncType::Method(receiver), import_to_add)
+    render(ctx, local_name, func, FuncKind::Method(receiver))
 }
 
 fn render(
     ctx @ RenderContext { completion, .. }: RenderContext<'_>,
     local_name: Option<hir::Name>,
     func: hir::Function,
-    func_type: FuncType,
-    import_to_add: Option<ImportEdit>,
+    func_kind: FuncKind,
 ) -> CompletionItem {
     let db = completion.db;
 
     let name = local_name.unwrap_or_else(|| func.name(db));
-    let params = params(completion, func, &func_type);
 
-    let call = match &func_type {
-        FuncType::Method(Some(receiver)) => format!("{}.{}", receiver, &name).into(),
+    let call = match &func_kind {
+        FuncKind::Method(Some(receiver)) => format!("{}.{}", receiver, &name).into(),
         _ => name.to_smol_str(),
     };
     let mut item = CompletionItem::new(
@@ -82,7 +77,7 @@ fn render(
         // FIXME
         // For now we don't properly calculate the edits for ref match
         // completions on methods, so we've disabled them. See #8058.
-        if matches!(func_type, FuncType::Function) {
+        if matches!(func_kind, FuncKind::Function) {
             item.ref_match(ref_match);
         }
     }
@@ -90,27 +85,153 @@ fn render(
     item.set_documentation(ctx.docs(func))
         .set_deprecated(ctx.is_deprecated(func) || ctx.is_deprecated_assoc_item(func))
         .detail(detail(db, func))
-        .add_call_parens(completion, call, params);
+        .lookup_by(name.to_smol_str());
 
-    if import_to_add.is_none() {
-        if let Some(actm) = func.as_assoc_item(db) {
-            if let Some(trt) = actm.containing_trait_or_trait_impl(db) {
-                item.trait_name(trt.name(db).to_smol_str());
+    match completion.config.snippet_cap {
+        Some(cap) if should_add_parens(completion) => {
+            let (self_param, params) = params(completion, func, &func_kind);
+            add_call_parens(&mut item, completion, cap, call, self_param, params);
+        }
+        _ => (),
+    }
+
+    match ctx.import_to_add {
+        Some(import_to_add) => {
+            item.add_import(import_to_add);
+        }
+        None => {
+            if let Some(actm) = func.as_assoc_item(db) {
+                if let Some(trt) = actm.containing_trait_or_trait_impl(db) {
+                    item.trait_name(trt.name(db).to_smol_str());
+                }
             }
         }
     }
-
-    if let Some(import_to_add) = import_to_add {
-        item.add_import(import_to_add);
-    }
-    item.lookup_by(name.to_smol_str());
-
     item.build()
+}
+
+pub(super) fn add_call_parens<'b>(
+    builder: &'b mut Builder,
+    ctx: &CompletionContext,
+    cap: SnippetCap,
+    name: SmolStr,
+    self_param: Option<hir::SelfParam>,
+    params: Vec<hir::Param>,
+) -> &'b mut Builder {
+    cov_mark::hit!(inserts_parens_for_function_calls);
+
+    let (snippet, label_suffix) = if self_param.is_none() && params.is_empty() {
+        (format!("{}()$0", name), "()")
+    } else {
+        builder.trigger_call_info();
+        let snippet = if ctx.config.add_call_argument_snippets {
+            let offset = if self_param.is_some() { 2 } else { 1 };
+            let function_params_snippet =
+                params.iter().enumerate().format_with(", ", |(index, param), f| {
+                    match param.name(ctx.db) {
+                        Some(n) => {
+                            let smol_str = n.to_smol_str();
+                            let text = smol_str.as_str().trim_start_matches('_');
+                            let ref_ = ref_of_param(ctx, text, param.ty());
+                            f(&format_args!("${{{}:{}{}}}", index + offset, ref_, text))
+                        }
+                        None => f(&format_args!("${{{}:_}}", index + offset,)),
+                    }
+                });
+            match self_param {
+                Some(self_param) => {
+                    format!(
+                        "{}(${{1:{}}}{}{})$0",
+                        name,
+                        self_param.display(ctx.db),
+                        if params.is_empty() { "" } else { ", " },
+                        function_params_snippet
+                    )
+                }
+                None => {
+                    format!("{}({})$0", name, function_params_snippet)
+                }
+            }
+        } else {
+            cov_mark::hit!(suppress_arg_snippets);
+            format!("{}($0)", name)
+        };
+
+        (snippet, "(…)")
+    };
+    builder.label(SmolStr::from_iter([&name, label_suffix])).insert_snippet(cap, snippet)
+}
+
+fn ref_of_param(ctx: &CompletionContext, arg: &str, ty: &hir::Type) -> &'static str {
+    if let Some(derefed_ty) = ty.remove_ref() {
+        for (name, local) in ctx.locals.iter() {
+            if name.as_text().as_deref() == Some(arg) {
+                return if local.ty(ctx.db) == derefed_ty {
+                    if ty.is_mutable_reference() {
+                        "&mut "
+                    } else {
+                        "&"
+                    }
+                } else {
+                    ""
+                };
+            }
+        }
+    }
+    ""
+}
+
+fn should_add_parens(ctx: &CompletionContext) -> bool {
+    if !ctx.config.add_call_parenthesis {
+        return false;
+    }
+
+    match ctx.path_context {
+        Some(PathCompletionCtx { kind: Some(PathKind::Expr), has_call_parens: true, .. }) => {
+            return false
+        }
+        Some(PathCompletionCtx { kind: Some(PathKind::Use | PathKind::Type), .. }) => {
+            cov_mark::hit!(no_parens_in_use_item);
+            return false;
+        }
+        _ => {}
+    };
+
+    if matches!(
+        ctx.completion_location,
+        Some(ImmediateLocation::MethodCall { has_parens: true, .. })
+    ) {
+        return false;
+    }
+
+    // Don't add parentheses if the expected type is some function reference.
+    if let Some(ty) = &ctx.expected_type {
+        // FIXME: check signature matches?
+        if ty.is_fn() {
+            cov_mark::hit!(no_call_parens_if_fn_ptr_needed);
+            return false;
+        }
+    }
+
+    // Nothing prevents us from adding parentheses
+    true
 }
 
 fn detail(db: &dyn HirDatabase, func: hir::Function) -> String {
     let ret_ty = func.ret_type(db);
-    let mut detail = format!("fn({})", params_display(db, func));
+    let mut detail = String::new();
+
+    if func.is_const(db) {
+        format_to!(detail, "const ");
+    }
+    if func.is_async(db) {
+        format_to!(detail, "async ");
+    }
+    if func.is_unsafe(db) {
+        format_to!(detail, "unsafe ");
+    }
+
+    format_to!(detail, "fn({})", params_display(db, func));
     if !ret_ty.is_unit() {
         format_to!(detail, " -> {}", ret_ty.display(db));
     }
@@ -138,21 +259,17 @@ fn params_display(db: &dyn HirDatabase, func: hir::Function) -> String {
     }
 }
 
-fn params(ctx: &CompletionContext<'_>, func: hir::Function, func_type: &FuncType) -> Params {
-    let (params, self_param) =
-        if ctx.has_dot_receiver() || matches!(func_type, FuncType::Method(Some(_))) {
-            (func.method_params(ctx.db).unwrap_or_default(), None)
-        } else {
-            let self_param = func.self_param(ctx.db);
-
-            let mut assoc_params = func.assoc_fn_params(ctx.db);
-            if self_param.is_some() {
-                assoc_params.remove(0);
-            }
-            (assoc_params, self_param)
-        };
-
-    Params::Named(self_param, params)
+fn params(
+    ctx: &CompletionContext<'_>,
+    func: hir::Function,
+    func_kind: &FuncKind,
+) -> (Option<hir::SelfParam>, Vec<hir::Param>) {
+    let self_param = if ctx.has_dot_receiver() || matches!(func_kind, FuncKind::Method(Some(_))) {
+        None
+    } else {
+        func.self_param(ctx.db)
+    };
+    (self_param, func.params_without_self(ctx.db))
 }
 
 #[cfg(test)]

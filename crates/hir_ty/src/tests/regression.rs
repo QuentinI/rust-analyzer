@@ -1245,3 +1245,235 @@ fn test() {
         "#]],
     );
 }
+
+#[test]
+fn while_loop_block_expr_iterable() {
+    check_infer(
+        r#"
+fn test() {
+    while { true } {
+        let y = 0;
+    }
+}
+        "#,
+        expect![[r#"
+            10..59 '{     ...   } }': ()
+            16..57 'while ...     }': ()
+            22..30 '{ true }': bool
+            24..28 'true': bool
+            31..57 '{     ...     }': ()
+            45..46 'y': i32
+            49..50 '0': i32
+        "#]],
+    );
+}
+
+#[test]
+fn bug_11242() {
+    // FIXME: wrong, should be u32
+    check_types(
+        r#"
+fn foo<A, B>()
+where
+    A: IntoIterator<Item = u32>,
+    B: IntoIterator<Item = usize>,
+{
+    let _x: <A as IntoIterator>::Item;
+     // ^^ {unknown}
+}
+
+pub trait Iterator {
+    type Item;
+}
+
+pub trait IntoIterator {
+    type Item;
+    type IntoIter: Iterator<Item = Self::Item>;
+}
+
+impl<I: Iterator> IntoIterator for I {
+    type Item = I::Item;
+    type IntoIter = I;
+}
+"#,
+    );
+}
+
+#[test]
+fn bug_11659() {
+    check_no_mismatches(
+        r#"
+struct LinkArray<const N: usize, LD>(LD);
+fn f<const N: usize, LD>(x: LD) -> LinkArray<N, LD> {
+    let r = LinkArray::<N, LD>(x);
+    r
+}
+
+fn test() {
+    let x = f::<2, i32>(5);
+    let y = LinkArray::<52, LinkArray<2, i32>>(x);
+}
+        "#,
+    );
+    check_no_mismatches(
+        r#"
+struct LinkArray<LD, const N: usize>(LD);
+fn f<const N: usize, LD>(x: LD) -> LinkArray<LD, N> {
+    let r = LinkArray::<LD, N>(x);
+    r
+}
+
+fn test() {
+    let x = f::<i32, 2>(5);
+    let y = LinkArray::<LinkArray<i32, 2>, 52>(x);
+}
+        "#,
+    );
+}
+
+#[test]
+fn const_generic_error_tolerance() {
+    check_no_mismatches(
+        r#"
+#[lang = "sized"]
+pub trait Sized {}
+
+struct CT<const N: usize, T>(T);
+struct TC<T, const N: usize>(T);
+fn f<const N: usize, T>(x: T) -> (CT<N, T>, TC<T, N>) {
+    let l = CT::<N, T>(x);
+    let r = TC::<N, T>(x);
+    (l, r)
+}
+
+trait TR1<const N: usize>;
+trait TR2<const N: usize>;
+
+impl<const N: usize, T> TR1<N> for CT<N, T>;
+impl<const N: usize, T> TR1<5> for TC<T, N>;
+impl<const N: usize, T> TR2<N> for CT<T, N>;
+
+trait TR3<const N: usize> {
+    fn tr3(&self) -> &Self;
+}
+
+impl<const N: usize, T> TR3<5> for TC<T, N> {
+    fn tr3(&self) -> &Self {
+        self
+    }
+}
+
+impl<const N: usize, T> TR3<Item = 5> for TC<T, N> {}
+impl<const N: usize, T> TR3<T> for TC<T, N> {}
+
+fn impl_trait<const N: usize>(inp: impl TR1<N>) {}
+fn dyn_trait<const N: usize>(inp: &dyn TR2<N>) {}
+fn impl_trait_bad<'a, const N: usize>(inp: impl TR1<i32>) -> impl TR1<'a, i32> {}
+fn impl_trait_very_bad<const N: usize>(inp: impl TR1<Item = i32>) -> impl TR1<'a, Item = i32, 5, Foo = N> {}
+
+fn test() {
+    f::<2, i32>(5);
+    f::<2, 2>(5);
+    f(5);
+    f::<i32>(5);
+    CT::<52, CT<2, i32>>(x);
+    CT::<CT<2, i32>>(x);
+    impl_trait_bad(5);
+    impl_trait_bad(12);
+    TR3<5>::tr3();
+    TR3<{ 2+3 }>::tr3();
+    TC::<i32, 10>(5).tr3();
+    TC::<i32, 20>(5).tr3();
+    TC::<i32, i32>(5).tr3();
+    TC::<i32, { 7 + 3 }>(5).tr3();
+}
+        "#,
+    );
+}
+
+#[test]
+fn const_generic_impl_trait() {
+    check_no_mismatches(
+        r#"
+        //- minicore: from
+
+        struct Foo<T, const M: usize>;
+
+        trait Tr<T> {
+            fn f(T) -> Self;
+        }
+
+        impl<T, const M: usize> Tr<[T; M]> for Foo<T, M> {
+            fn f(_: [T; M]) -> Self {
+                Self
+            }
+        }
+
+        fn test() {
+            Foo::f([1, 2, 7, 10]);
+        }
+        "#,
+    );
+}
+
+#[test]
+fn nalgebra_factorial() {
+    check_no_mismatches(
+        r#"
+        const FACTORIAL: [u128; 4] = [1, 1, 2, 6];
+
+        fn factorial(n: usize) -> u128 {
+            match FACTORIAL.get(n) {
+                Some(f) => *f,
+                None => panic!("{}! is greater than u128::MAX", n),
+            }
+        }
+        "#,
+    )
+}
+
+#[test]
+fn regression_11688_1() {
+    check_no_mismatches(
+        r#"
+        pub struct Buffer<T>(T);
+        type Writer = Buffer<u8>;
+        impl<T> Buffer<T> {
+            fn extend_from_array<const N: usize>(&mut self, xs: &[T; N]) {
+                loop {}
+            }
+        }
+        trait Encode<S> {
+            fn encode(self, w: &mut Writer, s: &mut S);
+        }
+        impl<S> Encode<S> for u8 {
+            fn encode(self, w: &mut Writer, _: &mut S) {
+                w.extend_from_array(&self.to_le_bytes());
+            }
+        }
+        "#,
+    );
+}
+
+#[test]
+fn regression_11688_2() {
+    check_types(
+        r#"
+        union MaybeUninit<T> {
+            uninit: (),
+            value: T,
+        }
+
+        impl<T> MaybeUninit<T> {
+            fn uninit_array<const LEN: usize>() -> [Self; LEN] {
+                loop {}
+            }
+        }
+
+        fn main() {
+            let x = MaybeUninit::<i32>::uninit_array::<1>();
+              //^ [MaybeUninit<i32>; 1]
+        }
+        "#,
+    );
+}

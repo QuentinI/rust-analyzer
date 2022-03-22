@@ -6,11 +6,11 @@ use std::{
 };
 
 use ide::{
-    Annotation, AnnotationKind, Assist, AssistKind, CallInfo, Cancellable, CompletionItem,
+    Annotation, AnnotationKind, Assist, AssistKind, Cancellable, CompletionItem,
     CompletionItemKind, CompletionRelevance, Documentation, FileId, FileRange, FileSystemEdit,
     Fold, FoldKind, Highlight, HlMod, HlOperator, HlPunct, HlRange, HlTag, Indel, InlayHint,
     InlayKind, Markup, NavigationTarget, ReferenceCategory, RenameError, Runnable, Severity,
-    SourceChange, StructureNodeKind, SymbolKind, TextEdit, TextRange, TextSize,
+    SignatureHelp, SourceChange, StructureNodeKind, SymbolKind, TextEdit, TextRange, TextSize,
 };
 use itertools::Itertools;
 use serde_json::to_value;
@@ -55,7 +55,9 @@ pub(crate) fn symbol_kind(symbol_kind: SymbolKind) -> lsp_types::SymbolKind {
         | SymbolKind::Attribute
         | SymbolKind::Derive => lsp_types::SymbolKind::FUNCTION,
         SymbolKind::Module | SymbolKind::ToolModule => lsp_types::SymbolKind::MODULE,
-        SymbolKind::TypeAlias | SymbolKind::TypeParam => lsp_types::SymbolKind::TYPE_PARAMETER,
+        SymbolKind::TypeAlias | SymbolKind::TypeParam | SymbolKind::SelfType => {
+            lsp_types::SymbolKind::TYPE_PARAMETER
+        }
         SymbolKind::Field => lsp_types::SymbolKind::FIELD,
         SymbolKind::Static => lsp_types::SymbolKind::CONSTANT,
         SymbolKind::Const => lsp_types::SymbolKind::CONSTANT,
@@ -124,6 +126,7 @@ pub(crate) fn completion_item_kind(
             SymbolKind::Macro => lsp_types::CompletionItemKind::FUNCTION,
             SymbolKind::Module => lsp_types::CompletionItemKind::MODULE,
             SymbolKind::SelfParam => lsp_types::CompletionItemKind::VALUE,
+            SymbolKind::SelfType => lsp_types::CompletionItemKind::TYPE_PARAMETER,
             SymbolKind::Static => lsp_types::CompletionItemKind::VALUE,
             SymbolKind::Struct => lsp_types::CompletionItemKind::STRUCT,
             SymbolKind::Trait => lsp_types::CompletionItemKind::INTERFACE,
@@ -333,7 +336,7 @@ fn completion_item(
 }
 
 pub(crate) fn signature_help(
-    call_info: CallInfo,
+    call_info: SignatureHelp,
     concise: bool,
     label_offsets: bool,
 ) -> lsp_types::SignatureHelp {
@@ -410,15 +413,57 @@ pub(crate) fn signature_help(
     }
 }
 
-pub(crate) fn inlay_hint(line_index: &LineIndex, inlay_hint: InlayHint) -> lsp_ext::InlayHint {
+pub(crate) fn inlay_hint(
+    render_colons: bool,
+    line_index: &LineIndex,
+    inlay_hint: InlayHint,
+) -> lsp_ext::InlayHint {
     lsp_ext::InlayHint {
-        label: inlay_hint.label.to_string(),
-        range: range(line_index, inlay_hint.range),
-        kind: match inlay_hint.kind {
-            InlayKind::ParameterHint => lsp_ext::InlayKind::ParameterHint,
-            InlayKind::TypeHint => lsp_ext::InlayKind::TypeHint,
-            InlayKind::ChainingHint => lsp_ext::InlayKind::ChainingHint,
+        label: lsp_ext::InlayHintLabel::String(match inlay_hint.kind {
+            InlayKind::ParameterHint if render_colons => format!("{}:", inlay_hint.label),
+            InlayKind::TypeHint if render_colons => format!(": {}", inlay_hint.label),
+            InlayKind::ClosureReturnTypeHint => format!(" -> {}", inlay_hint.label),
+            _ => inlay_hint.label.to_string(),
+        }),
+        position: match inlay_hint.kind {
+            // before annotated thing
+            InlayKind::ParameterHint | InlayKind::ImplicitReborrow => {
+                position(line_index, inlay_hint.range.start())
+            }
+            // after annotated thing
+            InlayKind::ClosureReturnTypeHint
+            | InlayKind::TypeHint
+            | InlayKind::ChainingHint
+            | InlayKind::GenericParamListHint
+            | InlayKind::LifetimeHint => position(line_index, inlay_hint.range.end()),
         },
+        kind: match inlay_hint.kind {
+            InlayKind::ParameterHint => Some(lsp_ext::InlayHintKind::PARAMETER),
+            InlayKind::ClosureReturnTypeHint | InlayKind::TypeHint | InlayKind::ChainingHint => {
+                Some(lsp_ext::InlayHintKind::TYPE)
+            }
+            InlayKind::GenericParamListHint
+            | InlayKind::LifetimeHint
+            | InlayKind::ImplicitReborrow => None,
+        },
+        tooltip: None,
+        padding_left: Some(match inlay_hint.kind {
+            InlayKind::TypeHint => !render_colons,
+            InlayKind::ParameterHint | InlayKind::ClosureReturnTypeHint => false,
+            InlayKind::ChainingHint => true,
+            InlayKind::GenericParamListHint => false,
+            InlayKind::LifetimeHint => false,
+            InlayKind::ImplicitReborrow => false,
+        }),
+        padding_right: Some(match inlay_hint.kind {
+            InlayKind::TypeHint | InlayKind::ChainingHint | InlayKind::ClosureReturnTypeHint => {
+                false
+            }
+            InlayKind::ParameterHint => true,
+            InlayKind::LifetimeHint => true,
+            InlayKind::GenericParamListHint => false,
+            InlayKind::ImplicitReborrow => false,
+        }),
     }
 }
 
@@ -483,6 +528,7 @@ fn semantic_token_type_and_modifiers(
             SymbolKind::Label => semantic_tokens::LABEL,
             SymbolKind::ValueParam => lsp_types::SemanticTokenType::PARAMETER,
             SymbolKind::SelfParam => semantic_tokens::SELF_KEYWORD,
+            SymbolKind::SelfType => semantic_tokens::SELF_TYPE_KEYWORD,
             SymbolKind::Local => lsp_types::SemanticTokenType::VARIABLE,
             SymbolKind::Function => {
                 if highlight.mods.contains(HlMod::Associated) {

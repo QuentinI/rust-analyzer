@@ -5,7 +5,7 @@ use std::sync::Arc;
 use base_db::{salsa, SourceDatabase};
 use either::Either;
 use limit::Limit;
-use mbe::{syntax_node_to_token_tree, ExpandError, ExpandResult};
+use mbe::syntax_node_to_token_tree;
 use rustc_hash::FxHashSet;
 use syntax::{
     algo::diff,
@@ -14,8 +14,9 @@ use syntax::{
 };
 
 use crate::{
-    ast_id_map::AstIdMap, hygiene::HygieneFrame, BuiltinAttrExpander, BuiltinDeriveExpander,
-    BuiltinFnLikeExpander, ExpandTo, HirFileId, HirFileIdRepr, MacroCallId, MacroCallKind,
+    ast_id_map::AstIdMap, builtin_attr_macro::pseudo_derive_attr_expansion, fixup,
+    hygiene::HygieneFrame, BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander,
+    ExpandError, ExpandResult, ExpandTo, HirFileId, HirFileIdRepr, MacroCallId, MacroCallKind,
     MacroCallLoc, MacroDefId, MacroDefKind, MacroFile, ProcMacroExpander,
 };
 
@@ -47,10 +48,10 @@ impl TokenExpander {
         db: &dyn AstDatabase,
         id: MacroCallId,
         tt: &tt::Subtree,
-    ) -> mbe::ExpandResult<tt::Subtree> {
+    ) -> ExpandResult<tt::Subtree> {
         match self {
-            TokenExpander::DeclarativeMacro { mac, .. } => mac.expand(tt),
-            TokenExpander::Builtin(it) => it.expand(db, id, tt),
+            TokenExpander::DeclarativeMacro { mac, .. } => mac.expand(tt).map_err(Into::into),
+            TokenExpander::Builtin(it) => it.expand(db, id, tt).map_err(Into::into),
             TokenExpander::BuiltinAttr(it) => it.expand(db, id, tt),
             TokenExpander::BuiltinDerive(it) => it.expand(db, id, tt),
             TokenExpander::ProcMacro(_) => {
@@ -108,7 +109,10 @@ pub trait AstDatabase: SourceDatabase {
 
     /// Lowers syntactic macro call to a token tree representation.
     #[salsa::transparent]
-    fn macro_arg(&self, id: MacroCallId) -> Option<Arc<(tt::Subtree, mbe::TokenMap)>>;
+    fn macro_arg(
+        &self,
+        id: MacroCallId,
+    ) -> Option<Arc<(tt::Subtree, mbe::TokenMap, fixup::SyntaxFixupUndoInfo)>>;
     /// Extracts syntax node, corresponding to a macro call. That's a firewall
     /// query, only typing in the macro call itself changes the returned
     /// subtree.
@@ -145,19 +149,28 @@ pub fn expand_speculative(
     let token_range = token_to_map.text_range();
 
     // Build the subtree and token mapping for the speculative args
-    let censor = censor_for_macro_input(&loc, &speculative_args);
-    let (mut tt, spec_args_tmap) =
-        mbe::syntax_node_to_token_tree_censored(&speculative_args, &censor);
+    let censor = censor_for_macro_input(&loc, speculative_args);
+    let mut fixups = fixup::fixup_syntax(speculative_args);
+    fixups.replace.extend(censor.into_iter().map(|node| (node, Vec::new())));
+    let (mut tt, spec_args_tmap, _) = mbe::syntax_node_to_token_tree_with_modifications(
+        speculative_args,
+        fixups.token_map,
+        fixups.next_id,
+        fixups.replace,
+        fixups.append,
+    );
 
     let (attr_arg, token_id) = match loc.kind {
-        MacroCallKind::Attr { invoc_attr_index, .. } => {
-            // Attributes may have an input token tree, build the subtree and map for this as well
-            // then try finding a token id for our token if it is inside this input subtree.
-            let item = ast::Item::cast(speculative_args.clone())?;
-            let attr = item
-                .doc_comments_and_attrs()
-                .nth(invoc_attr_index as usize)
-                .and_then(Either::left)?;
+        MacroCallKind::Attr { invoc_attr_index, is_derive, .. } => {
+            let attr = if is_derive {
+                // for pseudo-derive expansion we actually pass the attribute itself only
+                ast::Attr::cast(speculative_args.clone())
+            } else {
+                // Attributes may have an input token tree, build the subtree and map for this as well
+                // then try finding a token id for our token if it is inside this input subtree.
+                let item = ast::Item::cast(speculative_args.clone())?;
+                item.doc_comments_and_attrs().nth(invoc_attr_index as usize).and_then(Either::left)
+            }?;
             match attr.token_tree() {
                 Some(token_tree) => {
                     let (mut tree, map) = syntax_node_to_token_tree(attr.token_tree()?.syntax());
@@ -194,14 +207,19 @@ pub fn expand_speculative(
 
     // Do the actual expansion, we need to directly expand the proc macro due to the attribute args
     // Otherwise the expand query will fetch the non speculative attribute args and pass those instead.
-    let speculative_expansion = if let MacroDefKind::ProcMacro(expander, ..) = loc.def.kind {
-        tt.delimiter = None;
-        expander.expand(db, loc.krate, &tt, attr_arg.as_ref())
-    } else {
-        macro_def.expand(db, actual_macro_call, &tt)
+    let mut speculative_expansion = match loc.def.kind {
+        MacroDefKind::ProcMacro(expander, ..) => {
+            tt.delimiter = None;
+            expander.expand(db, loc.krate, &tt, attr_arg.as_ref())
+        }
+        MacroDefKind::BuiltInAttr(BuiltinAttrExpander::Derive, _) => {
+            pseudo_derive_attr_expansion(&tt, attr_arg.as_ref()?)
+        }
+        _ => macro_def.expand(db, actual_macro_call, &tt),
     };
 
     let expand_to = macro_expand_to(db, actual_macro_call);
+    fixup::reverse_fixups(&mut speculative_expansion.value, &spec_args_tmap, &fixups.undo_info);
     let (node, rev_tmap) = token_tree_to_syntax_node(&speculative_expansion.value, expand_to);
 
     let range = rev_tmap.first_range_by_token(token_id, token_to_map.kind())?;
@@ -289,20 +307,31 @@ fn parse_macro_expansion(
     }
 }
 
-fn macro_arg(db: &dyn AstDatabase, id: MacroCallId) -> Option<Arc<(tt::Subtree, mbe::TokenMap)>> {
+fn macro_arg(
+    db: &dyn AstDatabase,
+    id: MacroCallId,
+) -> Option<Arc<(tt::Subtree, mbe::TokenMap, fixup::SyntaxFixupUndoInfo)>> {
     let arg = db.macro_arg_text(id)?;
     let loc = db.lookup_intern_macro_call(id);
 
     let node = SyntaxNode::new_root(arg);
     let censor = censor_for_macro_input(&loc, &node);
-    let (mut tt, tmap) = mbe::syntax_node_to_token_tree_censored(&node, &censor);
+    let mut fixups = fixup::fixup_syntax(&node);
+    fixups.replace.extend(censor.into_iter().map(|node| (node, Vec::new())));
+    let (mut tt, tmap, _) = mbe::syntax_node_to_token_tree_with_modifications(
+        &node,
+        fixups.token_map,
+        fixups.next_id,
+        fixups.replace,
+        fixups.append,
+    );
 
     if loc.def.is_proc_macro() {
         // proc macros expect their inputs without parentheses, MBEs expect it with them included
         tt.delimiter = None;
     }
 
-    Some(Arc::new((tt, tmap)))
+    Some(Arc::new((tt, tmap, fixups.undo_info)))
 }
 
 fn censor_for_macro_input(loc: &MacroCallLoc, node: &SyntaxNode) -> FxHashSet<SyntaxNode> {
@@ -314,10 +343,12 @@ fn censor_for_macro_input(loc: &MacroCallLoc, node: &SyntaxNode) -> FxHashSet<Sy
                 ast::Item::cast(node.clone())?
                     .attrs()
                     .take(derive_attr_index as usize + 1)
+                    // FIXME
                     .filter(|attr| attr.simple_name().as_deref() == Some("derive"))
                     .map(|it| it.syntax().clone())
                     .collect()
             }
+            MacroCallKind::Attr { is_derive: true, .. } => return None,
             MacroCallKind::Attr { invoc_attr_index, .. } => {
                 cov_mark::hit!(attribute_macro_attr_censoring);
                 ast::Item::cast(node.clone())?
@@ -409,7 +440,11 @@ fn macro_expand(db: &dyn AstDatabase, id: MacroCallId) -> ExpandResult<Option<Ar
 
     let macro_arg = match db.macro_arg(id) {
         Some(it) => it,
-        None => return ExpandResult::str_err("Failed to lower macro args to token tree".into()),
+        None => {
+            return ExpandResult::only_err(ExpandError::Other(
+                "Failed to lower macro args to token tree".into(),
+            ))
+        }
     };
 
     let expander = match db.macro_def(loc.def) {
@@ -417,19 +452,27 @@ fn macro_expand(db: &dyn AstDatabase, id: MacroCallId) -> ExpandResult<Option<Ar
         // FIXME: This is weird -- we effectively report macro *definition*
         // errors lazily, when we try to expand the macro. Instead, they should
         // be reported at the definition site (when we construct a def map).
-        Err(err) => return ExpandResult::str_err(format!("invalid macro definition: {}", err)),
+        Err(err) => {
+            return ExpandResult::only_err(ExpandError::Other(
+                format!("invalid macro definition: {}", err).into(),
+            ))
+        }
     };
-    let ExpandResult { value: tt, err } = expander.expand(db, id, &macro_arg.0);
+    let ExpandResult { value: mut tt, err } = expander.expand(db, id, &macro_arg.0);
     // Set a hard limit for the expanded tt
     let count = tt.count();
-    // XXX: Make ExpandResult a real error and use .map_err instead?
     if TOKEN_LIMIT.check(count).is_err() {
-        return ExpandResult::str_err(format!(
-            "macro invocation exceeds token limit: produced {} tokens, limit is {}",
-            count,
-            TOKEN_LIMIT.inner(),
+        return ExpandResult::only_err(ExpandError::Other(
+            format!(
+                "macro invocation exceeds token limit: produced {} tokens, limit is {}",
+                count,
+                TOKEN_LIMIT.inner(),
+            )
+            .into(),
         ));
     }
+
+    fixup::reverse_fixups(&mut tt, &macro_arg.1, &macro_arg.2);
 
     ExpandResult { value: Some(Arc::new(tt)), err }
 }
@@ -442,7 +485,9 @@ fn expand_proc_macro(db: &dyn AstDatabase, id: MacroCallId) -> ExpandResult<tt::
     let loc: MacroCallLoc = db.lookup_intern_macro_call(id);
     let macro_arg = match db.macro_arg(id) {
         Some(it) => it,
-        None => return ExpandResult::str_err("No arguments for proc-macro".to_string()),
+        None => {
+            return ExpandResult::only_err(ExpandError::Other("No arguments for proc-macro".into()))
+        }
     };
 
     let expander = match loc.def.kind {

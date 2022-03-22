@@ -3,17 +3,20 @@
 use std::{fmt, mem, sync::Arc};
 
 use chalk_ir::{
-    cast::Cast, fold::Fold, interner::HasInterner, zip::Zip, FloatTy, IntTy, NoSolution,
-    TyVariableKind, UniverseIndex,
+    cast::Cast, fold::Fold, interner::HasInterner, zip::Zip, CanonicalVarKind, FloatTy, IntTy,
+    NoSolution, TyVariableKind, UniverseIndex,
 };
 use chalk_solve::infer::ParameterEnaVariableExt;
 use ena::unify::UnifyKey;
+use hir_expand::name;
+use stdx::never;
 
 use super::{InferOk, InferResult, InferenceContext, TypeError};
 use crate::{
-    db::HirDatabase, fold_tys, static_lifetime, AliasEq, AliasTy, BoundVar, Canonical, Const,
-    DebruijnIndex, GenericArg, Goal, Guidance, InEnvironment, InferenceVar, Interner, Lifetime,
-    ProjectionTy, Scalar, Solution, Substitution, TraitEnvironment, Ty, TyKind, VariableKind,
+    db::HirDatabase, fold_tys, static_lifetime, traits::FnTrait, AliasEq, AliasTy, BoundVar,
+    Canonical, Const, DebruijnIndex, GenericArg, GenericArgData, Goal, Guidance, InEnvironment,
+    InferenceVar, Interner, Lifetime, ParamKind, ProjectionTy, ProjectionTyExt, Scalar, Solution,
+    Substitution, TraitEnvironment, Ty, TyBuilder, TyExt, TyKind, VariableKind,
 };
 
 impl<'a> InferenceContext<'a> {
@@ -24,32 +27,20 @@ impl<'a> InferenceContext<'a> {
     where
         T::Result: HasInterner<Interner = Interner>,
     {
-        // try to resolve obligations before canonicalizing, since this might
-        // result in new knowledge about variables
-        self.resolve_obligations_as_possible();
         self.table.canonicalize(t)
     }
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Canonicalized<T>
+pub(crate) struct Canonicalized<T>
 where
     T: HasInterner<Interner = Interner>,
 {
-    pub(super) value: Canonical<T>,
+    pub(crate) value: Canonical<T>,
     free_vars: Vec<GenericArg>,
 }
 
 impl<T: HasInterner<Interner = Interner>> Canonicalized<T> {
-    /// this method is wrong and shouldn't exist
-    pub(super) fn decanonicalize_ty(&self, table: &mut InferenceTable, ty: Canonical<Ty>) -> Ty {
-        let mut vars = self.free_vars.clone();
-        while ty.binders.len(Interner) > vars.len() {
-            vars.push(table.new_type_var().cast(Interner));
-        }
-        chalk_ir::Substitute::apply(&vars, ty.value, Interner)
-    }
-
     pub(super) fn apply_solution(
         &self,
         ctx: &mut InferenceTable,
@@ -58,13 +49,13 @@ impl<T: HasInterner<Interner = Interner>> Canonicalized<T> {
         // the solution may contain new variables, which we need to convert to new inference vars
         let new_vars = Substitution::from_iter(
             Interner,
-            solution.binders.iter(Interner).map(|k| match k.kind {
+            solution.binders.iter(Interner).map(|k| match &k.kind {
                 VariableKind::Ty(TyVariableKind::General) => ctx.new_type_var().cast(Interner),
                 VariableKind::Ty(TyVariableKind::Integer) => ctx.new_integer_var().cast(Interner),
                 VariableKind::Ty(TyVariableKind::Float) => ctx.new_float_var().cast(Interner),
                 // Chalk can sometimes return new lifetime variables. We just use the static lifetime everywhere
                 VariableKind::Lifetime => static_lifetime().cast(Interner),
-                _ => panic!("const variable in solution"),
+                VariableKind::Const(ty) => ctx.new_const_var(ty.clone()).cast(Interner),
             }),
         );
         for (i, v) in solution.value.iter(Interner).enumerate() {
@@ -97,11 +88,17 @@ pub(crate) fn unify(
     let mut table = InferenceTable::new(db, env);
     let vars = Substitution::from_iter(
         Interner,
-        tys.binders
-            .iter(Interner)
-            // we always use type vars here because we want everything to
-            // fallback to Unknown in the end (kind of hacky, as below)
-            .map(|_| table.new_type_var()),
+        tys.binders.iter(Interner).map(|x| match &x.kind {
+            chalk_ir::VariableKind::Ty(_) => {
+                GenericArgData::Ty(table.new_type_var()).intern(Interner)
+            }
+            chalk_ir::VariableKind::Lifetime => {
+                GenericArgData::Ty(table.new_type_var()).intern(Interner)
+            } // FIXME: maybe wrong?
+            chalk_ir::VariableKind::Const(ty) => {
+                GenericArgData::Const(table.new_const_var(ty.clone())).intern(Interner)
+            }
+        }),
     );
     let ty1_with_vars = vars.apply(tys.value.0.clone(), Interner);
     let ty2_with_vars = vars.apply(tys.value.1.clone(), Interner);
@@ -127,8 +124,7 @@ pub(crate) fn unify(
     };
     Some(Substitution::from_iter(
         Interner,
-        vars.iter(Interner)
-            .map(|v| table.resolve_with_fallback(v.assert_ty_ref(Interner).clone(), &fallback)),
+        vars.iter(Interner).map(|v| table.resolve_with_fallback(v.clone(), &fallback)),
     ))
 }
 
@@ -150,7 +146,8 @@ pub(crate) struct InferenceTable<'a> {
 
 pub(crate) struct InferenceTableSnapshot {
     var_table_snapshot: chalk_solve::infer::InferenceSnapshot<Interner>,
-    // FIXME: snapshot type_variable_table, pending_obligations?
+    pending_obligations: Vec<Canonicalized<InEnvironment<Goal>>>,
+    type_variable_table_snapshot: Vec<TypeVariableData>,
 }
 
 impl<'a> InferenceTable<'a> {
@@ -203,13 +200,16 @@ impl<'a> InferenceTable<'a> {
         .intern(Interner)
     }
 
-    pub(super) fn canonicalize<T: Fold<Interner> + HasInterner<Interner = Interner>>(
+    pub(crate) fn canonicalize<T: Fold<Interner> + HasInterner<Interner = Interner>>(
         &mut self,
         t: T,
     ) -> Canonicalized<T::Result>
     where
         T::Result: HasInterner<Interner = Interner>,
     {
+        // try to resolve obligations before canonicalizing, since this might
+        // result in new knowledge about variables
+        self.resolve_obligations_as_possible();
         let result = self.var_unification_table.canonicalize(Interner, t);
         let free_vars = result
             .free_vars
@@ -225,7 +225,7 @@ impl<'a> InferenceTable<'a> {
     /// type annotation (e.g. from a let type annotation, field type or function
     /// call). `make_ty` handles this already, but e.g. for field types we need
     /// to do it as well.
-    pub(super) fn normalize_associated_types_in(&mut self, ty: Ty) -> Ty {
+    pub(crate) fn normalize_associated_types_in(&mut self, ty: Ty) -> Ty {
         fold_tys(
             ty,
             |ty, _| match ty.kind(Interner) {
@@ -238,7 +238,7 @@ impl<'a> InferenceTable<'a> {
         )
     }
 
-    pub(super) fn normalize_projection_ty(&mut self, proj_ty: ProjectionTy) -> Ty {
+    pub(crate) fn normalize_projection_ty(&mut self, proj_ty: ProjectionTy) -> Ty {
         let var = self.new_type_var();
         let alias_eq = AliasEq { alias: AliasTy::Projection(proj_ty), ty: var.clone() };
         let obligation = alias_eq.cast(Interner);
@@ -299,6 +299,25 @@ impl<'a> InferenceTable<'a> {
         self.resolve_with_fallback_inner(&mut Vec::new(), t, &fallback)
     }
 
+    pub(crate) fn fresh_subst(&mut self, binders: &[CanonicalVarKind<Interner>]) -> Substitution {
+        Substitution::from_iter(
+            Interner,
+            binders.iter().map(|kind| {
+                let param_infer_var =
+                    kind.map_ref(|&ui| self.var_unification_table.new_variable(ui));
+                param_infer_var.to_generic_arg(Interner)
+            }),
+        )
+    }
+
+    pub(crate) fn instantiate_canonical<T>(&mut self, canonical: Canonical<T>) -> T::Result
+    where
+        T: HasInterner<Interner = Interner> + Fold<Interner> + std::fmt::Debug,
+    {
+        let subst = self.fresh_subst(canonical.binders.as_slice(Interner));
+        subst.apply(canonical.value, Interner)
+    }
+
     fn resolve_with_fallback_inner<T>(
         &mut self,
         var_stack: &mut Vec<InferenceVar>,
@@ -351,16 +370,42 @@ impl<'a> InferenceTable<'a> {
     /// If `ty` is a type variable with known type, returns that type;
     /// otherwise, return ty.
     pub(crate) fn resolve_ty_shallow(&mut self, ty: &Ty) -> Ty {
+        self.resolve_obligations_as_possible();
         self.var_unification_table.normalize_ty_shallow(Interner, ty).unwrap_or_else(|| ty.clone())
     }
 
     pub(crate) fn snapshot(&mut self) -> InferenceTableSnapshot {
-        let snapshot = self.var_unification_table.snapshot();
-        InferenceTableSnapshot { var_table_snapshot: snapshot }
+        let var_table_snapshot = self.var_unification_table.snapshot();
+        let type_variable_table_snapshot = self.type_variable_table.clone();
+        let pending_obligations = self.pending_obligations.clone();
+        InferenceTableSnapshot {
+            var_table_snapshot,
+            pending_obligations,
+            type_variable_table_snapshot,
+        }
     }
 
     pub(crate) fn rollback_to(&mut self, snapshot: InferenceTableSnapshot) {
         self.var_unification_table.rollback_to(snapshot.var_table_snapshot);
+        self.type_variable_table = snapshot.type_variable_table_snapshot;
+        self.pending_obligations = snapshot.pending_obligations;
+    }
+
+    pub(crate) fn run_in_snapshot<T>(&mut self, f: impl FnOnce(&mut InferenceTable) -> T) -> T {
+        let snapshot = self.snapshot();
+        let result = f(self);
+        self.rollback_to(snapshot);
+        result
+    }
+
+    /// Checks an obligation without registering it. Useful mostly to check
+    /// whether a trait *might* be implemented before deciding to 'lock in' the
+    /// choice (during e.g. method resolution or deref).
+    pub(crate) fn try_obligation(&mut self, goal: Goal) -> Option<Solution> {
+        let in_env = InEnvironment::new(&self.trait_env.env, goal);
+        let canonicalized = self.canonicalize(in_env);
+        let solution = self.db.trait_solve(self.trait_env.krate, canonicalized.value);
+        solution
     }
 
     pub(crate) fn register_obligation(&mut self, goal: Goal) {
@@ -520,6 +565,58 @@ impl<'a> InferenceTable<'a> {
                 // FIXME obligation cannot be fulfilled => diagnostic
                 true
             }
+        }
+    }
+
+    pub(crate) fn callable_sig(&mut self, ty: &Ty, num_args: usize) -> Option<(Vec<Ty>, Ty)> {
+        match ty.callable_sig(self.db) {
+            Some(sig) => Some((sig.params().to_vec(), sig.ret().clone())),
+            None => self.callable_sig_from_fn_trait(ty, num_args),
+        }
+    }
+
+    fn callable_sig_from_fn_trait(&mut self, ty: &Ty, num_args: usize) -> Option<(Vec<Ty>, Ty)> {
+        let krate = self.trait_env.krate;
+        let fn_once_trait = FnTrait::FnOnce.get_id(self.db, krate)?;
+        let output_assoc_type =
+            self.db.trait_data(fn_once_trait).associated_type_by_name(&name![Output])?;
+
+        let mut arg_tys = vec![];
+        let arg_ty = TyBuilder::tuple(num_args)
+            .fill(|x| {
+                let arg = match x {
+                    ParamKind::Type => self.new_type_var(),
+                    ParamKind::Const(ty) => {
+                        never!("Tuple with const parameter");
+                        return GenericArgData::Const(self.new_const_var(ty.clone()))
+                            .intern(Interner);
+                    }
+                };
+                arg_tys.push(arg.clone());
+                GenericArgData::Ty(arg).intern(Interner)
+            })
+            .build();
+
+        let projection = {
+            let b = TyBuilder::assoc_type_projection(self.db, output_assoc_type);
+            if b.remaining() != 2 {
+                return None;
+            }
+            b.push(ty.clone()).push(arg_ty).build()
+        };
+
+        let trait_env = self.trait_env.env.clone();
+        let obligation = InEnvironment {
+            goal: projection.trait_ref(self.db).cast(Interner),
+            environment: trait_env,
+        };
+        let canonical = self.canonicalize(obligation.clone());
+        if self.db.trait_solve(krate, canonical.value.cast(Interner)).is_some() {
+            self.register_obligation(obligation.goal);
+            let return_ty = self.normalize_projection_ty(projection);
+            Some((arg_tys, return_ty))
+        } else {
+            None
         }
     }
 }

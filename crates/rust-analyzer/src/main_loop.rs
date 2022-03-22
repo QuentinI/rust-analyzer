@@ -167,7 +167,7 @@ impl GlobalState {
             self.handle_event(event)?
         }
 
-        return Err("client exited without proper shutdown sequence".into());
+        Err("client exited without proper shutdown sequence".into())
     }
 
     fn next_event(&self, inbox: &Receiver<lsp_server::Message>) -> Option<Event> {
@@ -455,7 +455,7 @@ impl GlobalState {
                 // Refresh semantic tokens if the client supports it.
                 if self.config.semantic_tokens_refresh() {
                     self.semantic_tokens_cache.lock().clear();
-                    self.send_request::<lsp_types::request::SemanticTokensRefesh>((), |_, _| ());
+                    self.send_request::<lsp_types::request::SemanticTokensRefresh>((), |_, _| ());
                 }
 
                 // Refresh code lens if the client supports it.

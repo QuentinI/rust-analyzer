@@ -1,11 +1,8 @@
 //! Name resolution façade.
-use std::sync::Arc;
+use std::{hash::BuildHasherDefault, sync::Arc};
 
 use base_db::CrateId;
-use hir_expand::{
-    name::{name, Name},
-    MacroDefId,
-};
+use hir_expand::name::{name, Name};
 use indexmap::IndexMap;
 use rustc_hash::FxHashSet;
 use smallvec::{smallvec, SmallVec};
@@ -15,7 +12,7 @@ use crate::{
     builtin_type::BuiltinType,
     db::DefDatabase,
     expr::{ExprId, LabelId, PatId},
-    generics::GenericParams,
+    generics::{GenericParams, TypeOrConstParamData},
     intern::Interned,
     item_scope::{BuiltinShadowMode, BUILTIN_SCOPE},
     nameres::DefMap,
@@ -24,8 +21,8 @@ use crate::{
     visibility::{RawVisibility, Visibility},
     AdtId, AssocItemId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExternBlockId,
     FunctionId, GenericDefId, GenericParamId, HasModule, ImplId, ItemContainerId, LifetimeParamId,
-    LocalModuleId, Lookup, ModuleDefId, ModuleId, StaticId, StructId, TraitId, TypeAliasId,
-    TypeParamId, VariantId,
+    LocalModuleId, Lookup, Macro2Id, MacroId, MacroRulesId, ModuleDefId, ModuleId, ProcMacroId,
+    StaticId, StructId, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId, VariantId,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -192,12 +189,9 @@ impl Resolver {
                 Scope::GenericParams { .. } | Scope::ImplDefScope(_) if skip_to_mod => continue,
 
                 Scope::GenericParams { params, def } => {
-                    if let Some(local_id) = params.find_type_by_name(first_name) {
+                    if let Some(id) = params.find_type_by_name(first_name, *def) {
                         let idx = if path.segments().len() == 1 { None } else { Some(1) };
-                        return Some((
-                            TypeNs::GenericParam(TypeParamId { local_id, parent: *def }),
-                            idx,
-                        ));
+                        return Some((TypeNs::GenericParam(id), idx));
                     }
                 }
                 Scope::ImplDefScope(impl_) => {
@@ -285,14 +279,14 @@ impl Resolver {
                 Scope::ExprScope(_) => continue,
 
                 Scope::GenericParams { params, def } if n_segments > 1 => {
-                    if let Some(local_id) = params.find_type_by_name(first_name) {
-                        let ty = TypeNs::GenericParam(TypeParamId { local_id, parent: *def });
+                    if let Some(id) = params.find_type_by_name(first_name, *def) {
+                        let ty = TypeNs::GenericParam(id);
                         return Some(ResolveValueResult::Partial(ty, 1));
                     }
                 }
                 Scope::GenericParams { params, def } if n_segments == 1 => {
-                    if let Some(local_id) = params.find_const_by_name(first_name) {
-                        let val = ValueNs::GenericParam(ConstParamId { local_id, parent: *def });
+                    if let Some(id) = params.find_const_by_name(first_name, *def) {
+                        let val = ValueNs::GenericParam(id);
                         return Some(ResolveValueResult::ValueNs(val));
                     }
                 }
@@ -341,11 +335,7 @@ impl Resolver {
         }
     }
 
-    pub fn resolve_path_as_macro(
-        &self,
-        db: &dyn DefDatabase,
-        path: &ModPath,
-    ) -> Option<MacroDefId> {
+    pub fn resolve_path_as_macro(&self, db: &dyn DefDatabase, path: &ModPath) -> Option<MacroId> {
         let (item_map, module) = self.module_scope()?;
         item_map.resolve_path(db, module, path, BuiltinShadowMode::Other).0.take_macros()
     }
@@ -353,7 +343,7 @@ impl Resolver {
     /// Returns a set of names available in the current scope.
     ///
     /// Note that this is a somewhat fuzzy concept -- internally, the compiler
-    /// doesn't necessary follow a strict scoping discipline. Rathe, it just
+    /// doesn't necessary follow a strict scoping discipline. Rather, it just
     /// tells for each ident what it resolves to.
     ///
     /// A good example is something like `str::from_utf8`. From scopes point of
@@ -388,10 +378,13 @@ impl Resolver {
     /// The result is ordered *roughly* from the innermost scope to the
     /// outermost: when the name is introduced in two namespaces in two scopes,
     /// we use the position of the first scope.
-    pub fn names_in_scope(&self, db: &dyn DefDatabase) -> IndexMap<Name, SmallVec<[ScopeDef; 1]>> {
+    pub fn names_in_scope(
+        &self,
+        db: &dyn DefDatabase,
+    ) -> FxIndexMap<Name, SmallVec<[ScopeDef; 1]>> {
         let mut res = ScopeNames::default();
         for scope in self.scopes() {
-            scope.process_names(db, &mut res);
+            scope.process_names(&mut res, db);
         }
         res.map
     }
@@ -476,10 +469,9 @@ impl Resolver {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ScopeDef {
     ModuleDef(ModuleDefId),
-    MacroDef(MacroDefId),
     Unknown,
     ImplSelfType(ImplId),
     AdtSelfType(AdtId),
@@ -489,7 +481,7 @@ pub enum ScopeDef {
 }
 
 impl Scope {
-    fn process_names(&self, db: &dyn DefDatabase, acc: &mut ScopeNames) {
+    fn process_names(&self, acc: &mut ScopeNames, db: &dyn DefDatabase) {
         match self {
             Scope::ModuleScope(m) => {
                 // FIXME: should we provide `self` here?
@@ -503,7 +495,7 @@ impl Scope {
                     acc.add_per_ns(name, def);
                 });
                 m.def_map[m.module_id].scope.legacy_macros().for_each(|(name, mac)| {
-                    acc.add(name, ScopeDef::MacroDef(mac));
+                    acc.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(MacroId::from(mac))));
                 });
                 m.def_map.extern_prelude().for_each(|(name, &def)| {
                     acc.add(name, ScopeDef::ModuleDef(def));
@@ -520,15 +512,22 @@ impl Scope {
             }
             Scope::GenericParams { params, def: parent } => {
                 let parent = *parent;
-                for (local_id, param) in params.types.iter() {
-                    if let Some(name) = &param.name {
-                        let id = TypeParamId { parent, local_id };
-                        acc.add(name, ScopeDef::GenericParam(id.into()))
+                for (local_id, param) in params.type_or_consts.iter() {
+                    if let Some(name) = &param.name() {
+                        let id = TypeOrConstParamId { parent, local_id };
+                        let data = &db.generic_params(parent).type_or_consts[local_id];
+                        acc.add(
+                            name,
+                            ScopeDef::GenericParam(match data {
+                                TypeOrConstParamData::TypeParamData(_) => {
+                                    GenericParamId::TypeParamId(TypeParamId::from_unchecked(id))
+                                }
+                                TypeOrConstParamData::ConstParamData(_) => {
+                                    GenericParamId::ConstParamId(ConstParamId::from_unchecked(id))
+                                }
+                            }),
+                        );
                     }
-                }
-                for (local_id, param) in params.consts.iter() {
-                    let id = ConstParamId { parent, local_id };
-                    acc.add(&param.name, ScopeDef::GenericParam(id.into()))
                 }
                 for (local_id, param) in params.lifetimes.iter() {
                     let id = LifetimeParamId { parent, local_id };
@@ -638,6 +637,7 @@ impl ModuleItemMap {
                     | ModuleDefId::FunctionId(_)
                     | ModuleDefId::EnumVariantId(_)
                     | ModuleDefId::ConstId(_)
+                    | ModuleDefId::MacroId(_)
                     | ModuleDefId::StaticId(_) => return None,
                 };
                 Some(ResolveValueResult::Partial(ty, idx))
@@ -669,6 +669,7 @@ fn to_value_ns(per_ns: PerNs) -> Option<ValueNs> {
         | ModuleDefId::TraitId(_)
         | ModuleDefId::TypeAliasId(_)
         | ModuleDefId::BuiltinType(_)
+        | ModuleDefId::MacroId(_)
         | ModuleDefId::ModuleId(_) => return None,
     };
     Some(res)
@@ -686,15 +687,17 @@ fn to_type_ns(per_ns: PerNs) -> Option<TypeNs> {
 
         ModuleDefId::FunctionId(_)
         | ModuleDefId::ConstId(_)
+        | ModuleDefId::MacroId(_)
         | ModuleDefId::StaticId(_)
         | ModuleDefId::ModuleId(_) => return None,
     };
     Some(res)
 }
 
+type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<rustc_hash::FxHasher>>;
 #[derive(Default)]
 struct ScopeNames {
-    map: IndexMap<Name, SmallVec<[ScopeDef; 1]>>,
+    map: FxIndexMap<Name, SmallVec<[ScopeDef; 1]>>,
 }
 
 impl ScopeNames {
@@ -705,14 +708,14 @@ impl ScopeNames {
         }
     }
     fn add_per_ns(&mut self, name: &Name, def: PerNs) {
-        if let Some(ty) = &def.types {
-            self.add(name, ScopeDef::ModuleDef(ty.0))
+        if let &Some((ty, _)) = &def.types {
+            self.add(name, ScopeDef::ModuleDef(ty))
         }
-        if let Some(val) = &def.values {
-            self.add(name, ScopeDef::ModuleDef(val.0))
+        if let &Some((def, _)) = &def.values {
+            self.add(name, ScopeDef::ModuleDef(def))
         }
-        if let Some(mac) = &def.macros {
-            self.add(name, ScopeDef::MacroDef(mac.0))
+        if let &Some((mac, _)) = &def.macros {
+            self.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)))
         }
         if def.is_none() {
             self.add(name, ScopeDef::Unknown)
@@ -854,5 +857,33 @@ impl HasResolver for VariantId {
             VariantId::StructId(it) => it.resolver(db),
             VariantId::UnionId(it) => it.resolver(db),
         }
+    }
+}
+
+impl HasResolver for MacroId {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        match self {
+            MacroId::Macro2Id(it) => it.resolver(db),
+            MacroId::MacroRulesId(it) => it.resolver(db),
+            MacroId::ProcMacroId(it) => it.resolver(db),
+        }
+    }
+}
+
+impl HasResolver for Macro2Id {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        self.lookup(db).container.resolver(db)
+    }
+}
+
+impl HasResolver for ProcMacroId {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        self.lookup(db).container.resolver(db)
+    }
+}
+
+impl HasResolver for MacroRulesId {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        self.lookup(db).container.resolver(db)
     }
 }

@@ -4,16 +4,20 @@ use std::{borrow::Cow, fs, path::Path};
 use itertools::Itertools;
 use stdx::format_to;
 use test_utils::project_root;
-use xshell::cmd;
+use xshell::{cmd, Shell};
 
 /// This clones rustc repo, and so is not worth to keep up-to-date. We update
 /// manually by un-ignoring the test from time to time.
 #[test]
 #[ignore]
 fn sourcegen_lint_completions() {
+    let sh = &Shell::new().unwrap();
+
     let rust_repo = project_root().join("./target/rust");
     if !rust_repo.exists() {
-        cmd!("git clone --depth=1 https://github.com/rust-lang/rust {rust_repo}").run().unwrap();
+        cmd!(sh, "git clone --depth=1 https://github.com/rust-lang/rust {rust_repo}")
+            .run()
+            .unwrap();
     }
 
     let mut contents = String::from(
@@ -30,28 +34,31 @@ pub struct LintGroup {
 ",
     );
 
-    generate_lint_descriptor(&mut contents);
+    generate_lint_descriptor(sh, &mut contents);
     contents.push('\n');
 
     generate_feature_descriptor(&mut contents, &rust_repo.join("src/doc/unstable-book/src"));
     contents.push('\n');
 
     let lints_json = project_root().join("./target/clippy_lints.json");
-    cmd!("curl https://rust-lang.github.io/rust-clippy/master/lints.json --output {lints_json}")
-        .run()
-        .unwrap();
+    cmd!(
+        sh,
+        "curl https://rust-lang.github.io/rust-clippy/master/lints.json --output {lints_json}"
+    )
+    .run()
+    .unwrap();
     generate_descriptor_clippy(&mut contents, &lints_json);
 
     let contents = sourcegen::add_preamble("sourcegen_lints", sourcegen::reformat(contents));
 
-    let destination = project_root().join("crates/ide_db/src/helpers/generated_lints.rs");
+    let destination = project_root().join("crates/ide_db/src/generated/lints.rs");
     sourcegen::ensure_file_contents(destination.as_path(), &contents);
 }
 
-fn generate_lint_descriptor(buf: &mut String) {
+fn generate_lint_descriptor(sh: &Shell, buf: &mut String) {
     // FIXME: rustdoc currently requires an input file for -Whelp cc https://github.com/rust-lang/rust/pull/88831
     let file = project_root().join(file!());
-    let stdout = cmd!("rustdoc -W help {file}").read().unwrap();
+    let stdout = cmd!(sh, "rustdoc -W help {file}").read().unwrap();
     let start_lints = stdout.find("----  -------  -------").unwrap();
     let start_lint_groups = stdout.find("----  ---------").unwrap();
     let start_lints_rustdoc =
@@ -75,7 +82,7 @@ fn generate_lint_descriptor(buf: &mut String) {
                 format!("lint group for: {}", lints.trim()).into(),
                 lints
                     .split_ascii_whitespace()
-                    .map(|s| s.trim().trim_matches(',').replace("-", "_"))
+                    .map(|s| s.trim().trim_matches(',').replace('-', "_"))
                     .collect(),
             )
         });
@@ -85,7 +92,7 @@ fn generate_lint_descriptor(buf: &mut String) {
         .sorted_by(|(ident, ..), (ident2, ..)| ident.cmp(ident2))
         .collect::<Vec<_>>();
     for (name, description, ..) in &lints {
-        push_lint_completion(buf, &name.replace("-", "_"), &description);
+        push_lint_completion(buf, &name.replace('-', "_"), description);
     }
     buf.push_str("];\n");
     buf.push_str(r#"pub const DEFAULT_LINT_GROUPS: &[LintGroup] = &["#);
@@ -93,10 +100,10 @@ fn generate_lint_descriptor(buf: &mut String) {
         if !children.is_empty() {
             // HACK: warnings is emitted with a general description, not with its members
             if name == &"warnings" {
-                push_lint_group(buf, &name, &description, &Vec::new());
+                push_lint_group(buf, name, description, &Vec::new());
                 continue;
             }
-            push_lint_group(buf, &name.replace("-", "_"), &description, children);
+            push_lint_group(buf, &name.replace('-', "_"), description, children);
         }
     }
     buf.push('\n');
@@ -124,7 +131,7 @@ fn generate_lint_descriptor(buf: &mut String) {
                     format!("lint group for: {}", lints.trim()).into(),
                     lints
                         .split_ascii_whitespace()
-                        .map(|s| s.trim().trim_matches(',').replace("-", "_"))
+                        .map(|s| s.trim().trim_matches(',').replace('-', "_"))
                         .collect(),
                 )
             },
@@ -136,14 +143,14 @@ fn generate_lint_descriptor(buf: &mut String) {
         .collect::<Vec<_>>();
 
     for (name, description, ..) in &lints_rustdoc {
-        push_lint_completion(buf, &name.replace("-", "_"), &description)
+        push_lint_completion(buf, &name.replace('-', "_"), description)
     }
     buf.push_str("];\n");
 
     buf.push_str(r#"pub const RUSTDOC_LINT_GROUPS: &[LintGroup] = &["#);
     for (name, description, children) in &lints_rustdoc {
         if !children.is_empty() {
-            push_lint_group(buf, &name.replace("-", "_"), &description, children);
+            push_lint_group(buf, &name.replace('-', "_"), description, children);
         }
     }
     buf.push('\n');
@@ -159,7 +166,7 @@ fn generate_feature_descriptor(buf: &mut String, src_dir: &Path) {
             path.extension().unwrap_or_default().to_str().unwrap_or_default() == "md"
         })
         .map(|path| {
-            let feature_ident = path.file_stem().unwrap().to_str().unwrap().replace("-", "_");
+            let feature_ident = path.file_stem().unwrap().to_str().unwrap().replace('-', "_");
             let doc = fs::read_to_string(path).unwrap();
             (feature_ident, doc)
         })

@@ -17,14 +17,22 @@ use hir_def::{
         Body, BodySourceMap,
     },
     expr::{ExprId, Pat, PatId},
+    macro_id_to_def_id,
     path::{ModPath, Path, PathKind},
     resolver::{resolver_for_scope, Resolver, TypeNs, ValueNs},
-    AsMacroCall, DefWithBodyId, FieldId, FunctionId, LocalFieldId, ModuleDefId, VariantId,
+    type_ref::Mutability,
+    AsMacroCall, DefWithBodyId, FieldId, FunctionId, LocalFieldId, Lookup, ModuleDefId, VariantId,
 };
-use hir_expand::{hygiene::Hygiene, name::AsName, HirFileId, InFile};
+use hir_expand::{
+    builtin_fn_macro::BuiltinFnLikeExpander, hygiene::Hygiene, name::AsName, HirFileId, InFile,
+};
 use hir_ty::{
-    diagnostics::{record_literal_missing_fields, record_pattern_missing_fields},
-    InferenceResult, Interner, Substitution, TyExt, TyLoweringContext,
+    diagnostics::{
+        record_literal_missing_fields, record_pattern_missing_fields, unsafe_expressions,
+        UnsafeExpr,
+    },
+    Adjust, Adjustment, AutoBorrow, InferenceResult, Interner, Substitution, TyExt,
+    TyLoweringContext,
 };
 use syntax::{
     ast::{self, AstNode},
@@ -33,8 +41,7 @@ use syntax::{
 
 use crate::{
     db::HirDatabase, semantics::PathResolution, Adt, BuiltinAttr, BuiltinType, Const, Field,
-    Function, Local, MacroDef, ModuleDef, Static, Struct, ToolModule, Trait, Type, TypeAlias,
-    TypeParam, Variant,
+    Function, Local, Macro, ModuleDef, Static, Struct, ToolModule, Trait, Type, TypeAlias, Variant,
 };
 use base_db::CrateId;
 
@@ -44,8 +51,7 @@ use base_db::CrateId;
 pub(crate) struct SourceAnalyzer {
     pub(crate) file_id: HirFileId,
     pub(crate) resolver: Resolver,
-    body: Option<Arc<Body>>,
-    body_source_map: Option<Arc<BodySourceMap>>,
+    def: Option<(DefWithBodyId, Arc<Body>, Arc<BodySourceMap>)>,
     infer: Option<Arc<InferenceResult>>,
 }
 
@@ -65,8 +71,7 @@ impl SourceAnalyzer {
         let resolver = resolver_for_scope(db.upcast(), def, scope);
         SourceAnalyzer {
             resolver,
-            body: Some(body),
-            body_source_map: Some(source_map),
+            def: Some((def, body, source_map)),
             infer: Some(db.infer(def)),
             file_id,
         }
@@ -85,26 +90,21 @@ impl SourceAnalyzer {
             Some(offset) => scope_for_offset(db, &scopes, &source_map, node.with_value(offset)),
         };
         let resolver = resolver_for_scope(db.upcast(), def, scope);
-        SourceAnalyzer {
-            resolver,
-            body: Some(body),
-            body_source_map: Some(source_map),
-            infer: None,
-            file_id,
-        }
+        SourceAnalyzer { resolver, def: Some((def, body, source_map)), infer: None, file_id }
     }
 
     pub(crate) fn new_for_resolver(
         resolver: Resolver,
         node: InFile<&SyntaxNode>,
     ) -> SourceAnalyzer {
-        SourceAnalyzer {
-            resolver,
-            body: None,
-            body_source_map: None,
-            infer: None,
-            file_id: node.file_id,
-        }
+        SourceAnalyzer { resolver, def: None, infer: None, file_id: node.file_id }
+    }
+
+    fn body_source_map(&self) -> Option<&BodySourceMap> {
+        self.def.as_ref().map(|(.., source_map)| &**source_map)
+    }
+    fn body(&self) -> Option<&Body> {
+        self.def.as_ref().map(|(_, body, _)| &**body)
     }
 
     fn expr_id(&self, db: &dyn HirDatabase, expr: &ast::Expr) -> Option<ExprId> {
@@ -114,14 +114,14 @@ impl SourceAnalyzer {
             }
             _ => InFile::new(self.file_id, expr.clone()),
         };
-        let sm = self.body_source_map.as_ref()?;
+        let sm = self.body_source_map()?;
         sm.node_expr(src.as_ref())
     }
 
     fn pat_id(&self, pat: &ast::Pat) -> Option<PatId> {
         // FIXME: macros, see `expr_id`
         let src = InFile { file_id: self.file_id, value: pat };
-        self.body_source_map.as_ref()?.node_pat(src)
+        self.body_source_map()?.node_pat(src)
     }
 
     fn expand_expr(
@@ -129,7 +129,7 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         expr: InFile<ast::MacroCall>,
     ) -> Option<InFile<ast::Expr>> {
-        let macro_file = self.body_source_map.as_ref()?.node_macro_file(expr.as_ref())?;
+        let macro_file = self.body_source_map()?.node_macro_file(expr.as_ref())?;
         let expanded = db.parse_or_expand(macro_file)?;
 
         let res = match ast::MacroCall::cast(expanded.clone()) {
@@ -137,6 +137,23 @@ impl SourceAnalyzer {
             _ => InFile::new(macro_file, ast::Expr::cast(expanded)?),
         };
         Some(res)
+    }
+
+    pub(crate) fn is_implicit_reborrow(
+        &self,
+        db: &dyn HirDatabase,
+        expr: &ast::Expr,
+    ) -> Option<Mutability> {
+        let expr_id = self.expr_id(db, expr)?;
+        let infer = self.infer.as_ref()?;
+        let adjustments = infer.expr_adjustments.get(&expr_id)?;
+        adjustments.windows(2).find_map(|slice| match slice {
+            &[Adjustment {kind: Adjust::Deref(None), ..}, Adjustment {kind: Adjust::Borrow(AutoBorrow::Ref(m)), ..}] => Some(match m {
+                hir_ty::Mutability::Mut => Mutability::Mut,
+                hir_ty::Mutability::Not => Mutability::Shared,
+            }),
+            _ => None,
+        })
     }
 
     pub(crate) fn type_of_expr(
@@ -177,7 +194,7 @@ impl SourceAnalyzer {
         param: &ast::SelfParam,
     ) -> Option<Type> {
         let src = InFile { file_id: self.file_id, value: param };
-        let pat_id = self.body_source_map.as_ref()?.node_self_param(src)?;
+        let pat_id = self.body_source_map()?.node_self_param(src)?;
         let ty = self.infer.as_ref()?[pat_id].clone();
         Type::new_with_resolver(db, &self.resolver, ty)
     }
@@ -207,7 +224,7 @@ impl SourceAnalyzer {
     ) -> Option<(Field, Option<Local>, Type)> {
         let record_expr = ast::RecordExpr::cast(field.syntax().parent().and_then(|p| p.parent())?)?;
         let expr = ast::Expr::from(record_expr);
-        let expr_id = self.body_source_map.as_ref()?.node_expr(InFile::new(self.file_id, &expr))?;
+        let expr_id = self.body_source_map()?.node_expr(InFile::new(self.file_id, &expr))?;
 
         let local_name = field.field_name()?.as_name();
         let local = if field.name_ref().is_some() {
@@ -248,7 +265,7 @@ impl SourceAnalyzer {
         &self,
         db: &dyn HirDatabase,
         macro_call: InFile<&ast::MacroCall>,
-    ) -> Option<MacroDef> {
+    ) -> Option<Macro> {
         let ctx = body::LowerCtx::new(db.upcast(), macro_call.file_id);
         let path = macro_call.value.path().and_then(|ast| Path::from_src(ast, &ctx))?;
         self.resolver.resolve_path_as_macro(db.upcast(), path.mod_path()).map(|it| it.into())
@@ -260,7 +277,7 @@ impl SourceAnalyzer {
         pat: &ast::IdentPat,
     ) -> Option<ModuleDef> {
         let pat_id = self.pat_id(&pat.clone().into())?;
-        let body = self.body.as_ref()?;
+        let body = self.body()?;
         let path = match &body[pat_id] {
             Pat::Path(path) => path,
             _ => return None,
@@ -371,10 +388,10 @@ impl SourceAnalyzer {
                 return builtin.map(PathResolution::BuiltinAttr);
             }
             return match resolve_hir_path_as_macro(db, &self.resolver, &hir_path) {
-                res @ Some(m) if m.is_attr() => res.map(PathResolution::Macro),
+                Some(m) => Some(PathResolution::Def(ModuleDef::Macro(m))),
                 // this labels any path that starts with a tool module as the tool itself, this is technically wrong
                 // but there is no benefit in differentiating these two cases for the time being
-                _ => path.first_segment().and_then(|it| it.name_ref()).and_then(|name_ref| {
+                None => path.first_segment().and_then(|it| it.name_ref()).and_then(|name_ref| {
                     match self.resolver.krate() {
                         Some(krate) => ToolModule::by_name(db, krate.into(), &name_ref.text()),
                         None => ToolModule::builtin(&name_ref.text()),
@@ -396,7 +413,7 @@ impl SourceAnalyzer {
         literal: &ast::RecordExpr,
     ) -> Option<Vec<(Field, Type)>> {
         let krate = self.resolver.krate()?;
-        let body = self.body.as_ref()?;
+        let body = self.body()?;
         let infer = self.infer.as_ref()?;
 
         let expr_id = self.expr_id(db, &literal.clone().into())?;
@@ -414,7 +431,7 @@ impl SourceAnalyzer {
         pattern: &ast::RecordPat,
     ) -> Option<Vec<(Field, Type)>> {
         let krate = self.resolver.krate()?;
-        let body = self.body.as_ref()?;
+        let body = self.body()?;
         let infer = self.infer.as_ref()?;
 
         let pat_id = self.pat_id(&pattern.clone().into())?;
@@ -453,7 +470,9 @@ impl SourceAnalyzer {
     ) -> Option<HirFileId> {
         let krate = self.resolver.krate()?;
         let macro_call_id = macro_call.as_call_id(db.upcast(), krate, |path| {
-            self.resolver.resolve_path_as_macro(db.upcast(), &path)
+            self.resolver
+                .resolve_path_as_macro(db.upcast(), &path)
+                .map(|it| macro_id_to_def_id(db.upcast(), it))
         })?;
         Some(macro_call_id.as_file()).filter(|it| it.expansion_level(db.upcast()) < 64)
     }
@@ -466,6 +485,50 @@ impl SourceAnalyzer {
         let infer = self.infer.as_ref()?;
         let expr_id = self.expr_id(db, &record_lit.into())?;
         infer.variant_resolution_for_expr(expr_id)
+    }
+
+    pub(crate) fn is_unsafe_macro_call(
+        &self,
+        db: &dyn HirDatabase,
+        macro_call: InFile<&ast::MacroCall>,
+    ) -> bool {
+        // check for asm/global_asm
+        if let Some(mac) = self.resolve_macro_call(db, macro_call) {
+            let ex = match mac.id {
+                hir_def::MacroId::Macro2Id(it) => it.lookup(db.upcast()).expander,
+                hir_def::MacroId::MacroRulesId(it) => it.lookup(db.upcast()).expander,
+                _ => hir_def::MacroExpander::Declarative,
+            };
+            match ex {
+                hir_def::MacroExpander::BuiltIn(e)
+                    if e == BuiltinFnLikeExpander::Asm || e == BuiltinFnLikeExpander::GlobalAsm =>
+                {
+                    return true
+                }
+                _ => (),
+            }
+        }
+        if let (Some((def, body, sm)), Some(infer)) = (&self.def, &self.infer) {
+            if let Some(expr_ids) = sm.macro_expansion_expr(macro_call) {
+                let mut is_unsafe = false;
+                for &expr_id in expr_ids {
+                    unsafe_expressions(
+                        db,
+                        infer,
+                        *def,
+                        body,
+                        expr_id,
+                        &mut |UnsafeExpr { inside_unsafe_block, .. }| {
+                            is_unsafe |= !inside_unsafe_block
+                        },
+                    );
+                    if is_unsafe {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -571,7 +634,7 @@ pub(crate) fn resolve_hir_path_as_macro(
     db: &dyn HirDatabase,
     resolver: &Resolver,
     path: &Path,
-) -> Option<MacroDef> {
+) -> Option<Macro> {
     resolver.resolve_path_as_macro(db.upcast(), path.mod_path()).map(Into::into)
 }
 
@@ -601,7 +664,7 @@ fn resolve_hir_path_(
         // within the trait's associated types.
         if let (Some(unresolved), &TypeNs::TraitId(trait_id)) = (&unresolved, &ty) {
             if let Some(type_alias_id) =
-                db.trait_data(trait_id).associated_type_by_name(&unresolved.name)
+                db.trait_data(trait_id).associated_type_by_name(unresolved.name)
             {
                 return Some(PathResolution::Def(ModuleDefId::from(type_alias_id).into()));
             }
@@ -609,7 +672,7 @@ fn resolve_hir_path_(
 
         let res = match ty {
             TypeNs::SelfType(it) => PathResolution::SelfType(it.into()),
-            TypeNs::GenericParam(id) => PathResolution::TypeParam(TypeParam { id }),
+            TypeNs::GenericParam(id) => PathResolution::TypeParam(id.into()),
             TypeNs::AdtSelfType(it) | TypeNs::AdtId(it) => {
                 PathResolution::Def(Adt::from(it).into())
             }
@@ -650,7 +713,7 @@ fn resolve_hir_path_(
                 ValueNs::StructId(it) => PathResolution::Def(Struct::from(it).into()),
                 ValueNs::EnumVariantId(it) => PathResolution::Def(Variant::from(it).into()),
                 ValueNs::ImplSelf(impl_id) => PathResolution::SelfType(impl_id.into()),
-                ValueNs::GenericParam(it) => PathResolution::ConstParam(it.into()),
+                ValueNs::GenericParam(id) => PathResolution::ConstParam(id.into()),
             };
             Some(res)
         })
@@ -666,7 +729,7 @@ fn resolve_hir_path_(
     let macros = || {
         resolver
             .resolve_path_as_macro(db.upcast(), path.mod_path())
-            .map(|def| PathResolution::Macro(def.into()))
+            .map(|def| PathResolution::Def(ModuleDef::Macro(def.into())))
     };
 
     if prefer_value_ns { values().or_else(types) } else { types().or_else(values) }
@@ -703,7 +766,7 @@ fn resolve_hir_path_qualifier(
 
     resolver.resolve_path_in_type_ns_fully(db.upcast(), path.mod_path()).map(|ty| match ty {
         TypeNs::SelfType(it) => PathResolution::SelfType(it.into()),
-        TypeNs::GenericParam(id) => PathResolution::TypeParam(TypeParam { id }),
+        TypeNs::GenericParam(id) => PathResolution::TypeParam(id.into()),
         TypeNs::AdtSelfType(it) | TypeNs::AdtId(it) => PathResolution::Def(Adt::from(it).into()),
         TypeNs::EnumVariantId(it) => PathResolution::Def(Variant::from(it).into()),
         TypeNs::TypeAliasId(it) => PathResolution::Def(TypeAlias::from(it).into()),

@@ -2,23 +2,19 @@
 use std::fmt::Display;
 
 use either::Either;
-use hir::{AsAssocItem, AttributeTemplate, HasAttrs, HasSource, HirDisplay, Semantics, TypeInfo};
+use hir::{AsAssocItem, AttributeTemplate, HasAttrs, HirDisplay, Semantics, TypeInfo};
 use ide_db::{
     base_db::SourceDatabase,
     defs::Definition,
-    helpers::{
-        generated_lints::{CLIPPY_LINTS, DEFAULT_LINTS, FEATURES},
-        FamousDefs,
-    },
+    famous_defs::FamousDefs,
+    generated::lints::{CLIPPY_LINTS, DEFAULT_LINTS, FEATURES},
     RootDatabase,
 };
 use itertools::Itertools;
 use stdx::format_to;
 use syntax::{
-    algo, ast,
-    display::{fn_as_proc_macro_label, macro_label},
-    match_ast, AstNode, Direction,
-    SyntaxKind::{CONDITION, LET_STMT},
+    algo, ast, match_ast, AstNode, Direction,
+    SyntaxKind::{LET_EXPR, LET_STMT},
     SyntaxToken, T,
 };
 
@@ -107,7 +103,7 @@ pub(super) fn try_expr(
 
     let adts = inner_ty.as_adt().zip(body_ty.as_adt());
     if let Some((hir::Adt::Enum(inner), hir::Adt::Enum(body))) = adts {
-        let famous_defs = FamousDefs(sema, sema.scope(&try_expr.syntax()).krate());
+        let famous_defs = FamousDefs(sema, sema.scope(try_expr.syntax()).krate());
         // special case for two options, there is no value in showing them
         if let Some(option_enum) = famous_defs.core_option_Option() {
             if inner == option_enum && body == option_enum {
@@ -239,22 +235,18 @@ pub(super) fn keyword(
     }
     let parent = token.parent()?;
     let famous_defs = FamousDefs(sema, sema.scope(&parent).krate());
-    let keyword_mod = if token.kind() == T![fn] && ast::FnPtrType::cast(parent).is_some() {
-        // treat fn keyword inside function pointer type as primitive
-        format!("prim_{}", token.text())
-    } else {
-        // std exposes {}_keyword modules with docstrings on the root to document keywords
-        format!("{}_keyword", token.text())
-    };
+
+    let KeywordHint { description, keyword_mod, actions } = keyword_hints(sema, token, parent);
+
     let doc_owner = find_std_module(&famous_defs, &keyword_mod)?;
     let docs = doc_owner.attrs(sema.db).docs()?;
     let markup = process_markup(
         sema.db,
         Definition::Module(doc_owner),
-        &markup(Some(docs.into()), token.text().into(), None)?,
+        &markup(Some(docs.into()), description, None)?,
         config,
     );
-    Some(HoverResult { markup, actions: Default::default() })
+    Some(HoverResult { markup, actions })
 }
 
 pub(super) fn try_for_lint(attr: &ast::Attr, token: &SyntaxToken) -> Option<HoverResult> {
@@ -348,14 +340,8 @@ pub(super) fn definition(
 ) -> Option<Markup> {
     let mod_path = definition_mod_path(db, &def);
     let (label, docs) = match def {
-        Definition::Macro(it) => (
-            match &it.source(db)?.value {
-                Either::Left(mac) => macro_label(mac),
-                Either::Right(mac_fn) => fn_as_proc_macro_label(mac_fn),
-            },
-            it.attrs(db).docs(),
-        ),
-        Definition::Field(def) => label_and_docs(db, def),
+        Definition::Macro(it) => label_and_docs(db, it),
+        Definition::Field(it) => label_and_docs(db, it),
         Definition::Module(it) => label_and_docs(db, it),
         Definition::Function(it) => label_and_docs(db, it),
         Definition::Adt(it) => label_and_docs(db, it),
@@ -484,11 +470,11 @@ fn local(db: &RootDatabase, it: hir::Local) -> Option<Markup> {
     let is_mut = if it.is_mut(db) { "mut " } else { "" };
     let desc = match it.source(db).value {
         Either::Left(ident) => {
-            let name = it.name(db).unwrap();
+            let name = it.name(db);
             let let_kw = if ident
                 .syntax()
                 .parent()
-                .map_or(false, |p| p.kind() == LET_STMT || p.kind() == CONDITION)
+                .map_or(false, |p| p.kind() == LET_STMT || p.kind() == LET_EXPR)
             {
                 "let "
             } else {
@@ -499,4 +485,65 @@ fn local(db: &RootDatabase, it: hir::Local) -> Option<Markup> {
         Either::Right(_) => format!("{}self: {}", is_mut, ty),
     };
     markup(None, desc, None)
+}
+
+struct KeywordHint {
+    description: String,
+    keyword_mod: String,
+    actions: Vec<HoverAction>,
+}
+
+impl KeywordHint {
+    fn new(description: String, keyword_mod: String) -> Self {
+        Self { description, keyword_mod, actions: Vec::default() }
+    }
+}
+
+fn keyword_hints(
+    sema: &Semantics<RootDatabase>,
+    token: &SyntaxToken,
+    parent: syntax::SyntaxNode,
+) -> KeywordHint {
+    match token.kind() {
+        T![await] | T![loop] | T![match] | T![unsafe] | T![as] | T![try] | T![if] | T![else] => {
+            let keyword_mod = format!("{}_keyword", token.text());
+
+            match ast::Expr::cast(parent).and_then(|site| sema.type_of_expr(&site)) {
+                // ignore the unit type ()
+                Some(ty) if !ty.adjusted.as_ref().unwrap_or(&ty.original).is_unit() => {
+                    let mut targets: Vec<hir::ModuleDef> = Vec::new();
+                    let mut push_new_def = |item: hir::ModuleDef| {
+                        if !targets.contains(&item) {
+                            targets.push(item);
+                        }
+                    };
+                    walk_and_push_ty(sema.db, &ty.original, &mut push_new_def);
+
+                    let ty = ty.adjusted();
+                    let description = format!("{}: {}", token.text(), ty.display(sema.db));
+
+                    KeywordHint {
+                        description,
+                        keyword_mod,
+                        actions: vec![HoverAction::goto_type_from_targets(sema.db, targets)],
+                    }
+                }
+                _ => KeywordHint {
+                    description: token.text().to_string(),
+                    keyword_mod,
+                    actions: Vec::new(),
+                },
+            }
+        }
+        T![fn] => {
+            let module = match ast::FnPtrType::cast(parent) {
+                // treat fn keyword inside function pointer type as primitive
+                Some(_) => format!("prim_{}", token.text()),
+                None => format!("{}_keyword", token.text()),
+            };
+            KeywordHint::new(token.text().to_string(), module)
+        }
+        T![Self] => KeywordHint::new(token.text().to_string(), "self_upper_keyword".into()),
+        _ => KeywordHint::new(token.text().to_string(), format!("{}_keyword", token.text())),
+    }
 }

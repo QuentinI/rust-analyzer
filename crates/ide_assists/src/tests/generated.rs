@@ -922,6 +922,7 @@ impl Version {
     /// Returns `true` if the version is [`Minor`].
     ///
     /// [`Minor`]: Version::Minor
+    #[must_use]
     fn is_minor(&self) -> bool {
         matches!(self, Self::Minor)
     }
@@ -1036,6 +1037,7 @@ struct Person {
 
 impl Person {
     /// Get a reference to the person's name.
+    #[must_use]
     fn $0name(&self) -> &str {
         self.name.as_ref()
     }
@@ -1060,6 +1062,7 @@ struct Person {
 
 impl Person {
     /// Get a mutable reference to the person's name.
+    #[must_use]
     fn $0name_mut(&mut self) -> &mut String {
         &mut self.name
     }
@@ -1097,6 +1100,7 @@ fn doctest_generate_is_empty_from_len() {
 struct MyStruct { data: Vec<String> }
 
 impl MyStruct {
+    #[must_use]
     p$0ub fn len(&self) -> usize {
         self.data.len()
     }
@@ -1106,10 +1110,12 @@ impl MyStruct {
 struct MyStruct { data: Vec<String> }
 
 impl MyStruct {
+    #[must_use]
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1133,6 +1139,7 @@ struct Ctx<T: Clone> {
 }
 
 impl<T: Clone> Ctx<T> {
+    #[must_use]
     fn $0new(data: T) -> Self { Self { data } }
 }
 "#####,
@@ -1234,6 +1241,27 @@ fn main() {
         r#####"
 fn main() {
     (1 + 2) * 4;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_inline_type_alias() {
+    check_doc_test(
+        "inline_type_alias",
+        r#####"
+type A<T = u32> = Vec<T>;
+
+fn main() {
+    let a: $0A;
+}
+"#####,
+        r#####"
+type A<T = u32> = Vec<T>;
+
+fn main() {
+    let a: Vec<u32>;
 }
 "#####,
     )
@@ -1766,6 +1794,7 @@ fn doctest_replace_derive_with_manual_impl() {
     check_doc_test(
         "replace_derive_with_manual_impl",
         r#####"
+//- minicore: derive
 trait Debug { fn fmt(&self, f: &mut Formatter) -> Result<()>; }
 #[derive(Deb$0ug, Display)]
 struct S;

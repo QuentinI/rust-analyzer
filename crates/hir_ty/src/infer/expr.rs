@@ -1,20 +1,21 @@
 //! Type inference for expressions.
 
 use std::{
+    collections::hash_map::Entry,
     iter::{repeat, repeat_with},
     mem,
     sync::Arc,
 };
 
-use chalk_ir::{cast::Cast, fold::Shift, Mutability, TyVariableKind};
+use chalk_ir::{
+    cast::Cast, fold::Shift, DebruijnIndex, GenericArgData, Mutability, TyVariableKind,
+};
 use hir_def::{
-    expr::{
-        ArithOp, Array, BinaryOp, CmpOp, Expr, ExprId, Literal, MatchGuard, Ordering, Statement,
-        UnaryOp,
-    },
+    expr::{ArithOp, Array, BinaryOp, CmpOp, Expr, ExprId, Literal, Ordering, Statement, UnaryOp},
+    generics::TypeOrConstParamData,
     path::{GenericArg, GenericArgs},
     resolver::resolver_for_expr,
-    FieldId, FunctionId, ItemContainerId, Lookup,
+    ConstParamId, FieldId, FunctionId, ItemContainerId, Lookup,
 };
 use hir_expand::name::{name, Name};
 use stdx::always;
@@ -24,24 +25,25 @@ use crate::{
     autoderef::{self, Autoderef},
     consteval,
     infer::coerce::CoerceMany,
-    lower::lower_to_chalk_mutability,
-    mapping::from_chalk,
+    lower::{
+        const_or_path_to_chalk, generic_arg_to_chalk, lower_to_chalk_mutability, ParamLoweringMode,
+    },
+    mapping::{from_chalk, ToChalk},
     method_resolution,
     primitive::{self, UintTy},
     static_lifetime, to_chalk_trait_id,
-    traits::FnTrait,
     utils::{generics, Generics},
-    AdtId, Binders, CallableDefId, FnPointer, FnSig, FnSubst, InEnvironment, Interner,
-    ProjectionTyExt, Rawness, Scalar, Substitution, TraitRef, Ty, TyBuilder, TyExt, TyKind,
+    AdtId, Binders, CallableDefId, FnPointer, FnSig, FnSubst, Interner, Rawness, Scalar,
+    Substitution, TraitRef, Ty, TyBuilder, TyExt, TyKind,
 };
 
 use super::{
-    find_breakable, BindingMode, BreakableContext, Diverges, Expectation, InferenceContext,
-    InferenceDiagnostic, TypeMismatch,
+    coerce::auto_deref_adjust_steps, find_breakable, BindingMode, BreakableContext, Diverges,
+    Expectation, InferenceContext, InferenceDiagnostic, TypeMismatch,
 };
 
 impl<'a> InferenceContext<'a> {
-    pub(super) fn infer_expr(&mut self, tgt_expr: ExprId, expected: &Expectation) -> Ty {
+    pub(crate) fn infer_expr(&mut self, tgt_expr: ExprId, expected: &Expectation) -> Ty {
         let ty = self.infer_expr_inner(tgt_expr, expected);
         if self.resolve_ty_shallow(&ty).is_never() {
             // Any expression that produces a value of type `!` must have diverged
@@ -65,7 +67,7 @@ impl<'a> InferenceContext<'a> {
         let ty = self.infer_expr_inner(expr, expected);
         if let Some(target) = expected.only_has_type(&mut self.table) {
             match self.coerce(Some(expr), &ty, &target) {
-                Ok(res) => res.value,
+                Ok(res) => res,
                 Err(_) => {
                     self.result
                         .type_mismatches
@@ -80,51 +82,6 @@ impl<'a> InferenceContext<'a> {
         }
     }
 
-    fn callable_sig_from_fn_trait(&mut self, ty: &Ty, num_args: usize) -> Option<(Vec<Ty>, Ty)> {
-        let krate = self.resolver.krate()?;
-        let fn_once_trait = FnTrait::FnOnce.get_id(self.db, krate)?;
-        let output_assoc_type =
-            self.db.trait_data(fn_once_trait).associated_type_by_name(&name![Output])?;
-
-        let mut arg_tys = vec![];
-        let arg_ty = TyBuilder::tuple(num_args)
-            .fill(repeat_with(|| {
-                let arg = self.table.new_type_var();
-                arg_tys.push(arg.clone());
-                arg
-            }))
-            .build();
-
-        let projection = {
-            let b = TyBuilder::assoc_type_projection(self.db, output_assoc_type);
-            if b.remaining() != 2 {
-                return None;
-            }
-            b.push(ty.clone()).push(arg_ty).build()
-        };
-
-        let trait_env = self.trait_env.env.clone();
-        let obligation = InEnvironment {
-            goal: projection.trait_ref(self.db).cast(Interner),
-            environment: trait_env,
-        };
-        let canonical = self.canonicalize(obligation.clone());
-        if self.db.trait_solve(krate, canonical.value.cast(Interner)).is_some() {
-            self.push_obligation(obligation.goal);
-            let return_ty = self.table.normalize_projection_ty(projection);
-            Some((arg_tys, return_ty))
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn callable_sig(&mut self, ty: &Ty, num_args: usize) -> Option<(Vec<Ty>, Ty)> {
-        match ty.callable_sig(self.db) {
-            Some(sig) => Some((sig.params().to_vec(), sig.ret().clone())),
-            None => self.callable_sig_from_fn_trait(ty, num_args),
-        }
-    }
-
     fn infer_expr_inner(&mut self, tgt_expr: ExprId, expected: &Expectation) -> Ty {
         self.db.unwind_if_cancelled();
 
@@ -132,7 +89,6 @@ impl<'a> InferenceContext<'a> {
         let ty = match &body[tgt_expr] {
             Expr::Missing => self.err_ty(),
             &Expr::If { condition, then_branch, else_branch } => {
-                // if let is desugared to match, so this is always simple if
                 self.infer_expr(
                     condition,
                     &Expectation::has_type(TyKind::Scalar(Scalar::Bool).intern(Interner)),
@@ -157,6 +113,11 @@ impl<'a> InferenceContext<'a> {
                 self.diverges = condition_diverges | both_arms_diverge;
 
                 coerce.complete()
+            }
+            &Expr::Let { pat, expr } => {
+                let input_ty = self.infer_expr(expr, &Expectation::none());
+                self.infer_pat(pat, &input_ty, BindingMode::default());
+                TyKind::Scalar(Scalar::Bool).intern(Interner)
             }
             Expr::Block { statements, tail, label, id: _ } => {
                 let old_resolver = mem::replace(
@@ -227,7 +188,6 @@ impl<'a> InferenceContext<'a> {
                     coerce: CoerceMany::new(self.err_ty()),
                     label: label.map(|label| self.body[label].name.clone()),
                 });
-                // while let is desugared to a match loop, so this is always simple while
                 self.infer_expr(
                     *condition,
                     &Expectation::has_type(TyKind::Scalar(Scalar::Bool).intern(Interner)),
@@ -317,26 +277,26 @@ impl<'a> InferenceContext<'a> {
             }
             Expr::Call { callee, args } => {
                 let callee_ty = self.infer_expr(*callee, &Expectation::none());
-                let canonicalized = self.canonicalize(callee_ty.clone());
-                let mut derefs = Autoderef::new(
-                    self.db,
-                    self.resolver.krate(),
-                    InEnvironment {
-                        goal: canonicalized.value.clone(),
-                        environment: self.table.trait_env.env.clone(),
-                    },
-                );
-                let res = derefs.by_ref().find_map(|(callee_deref_ty, _)| {
-                    let ty = &canonicalized.decanonicalize_ty(&mut self.table, callee_deref_ty);
-                    self.callable_sig(ty, args.len())
-                });
-                let (param_tys, ret_ty): (Vec<Ty>, Ty) = match res {
+                let mut derefs = Autoderef::new(&mut self.table, callee_ty.clone());
+                let mut res = None;
+                let mut derefed_callee = callee_ty.clone();
+                // manual loop to be able to access `derefs.table`
+                while let Some((callee_deref_ty, _)) = derefs.next() {
+                    res = derefs.table.callable_sig(&callee_deref_ty, args.len());
+                    if res.is_some() {
+                        derefed_callee = callee_deref_ty;
+                        break;
+                    }
+                }
+                let (param_tys, ret_ty) = match res {
                     Some(res) => {
-                        self.write_expr_adj(*callee, self.auto_deref_adjust_steps(&derefs));
+                        let adjustments = auto_deref_adjust_steps(&derefs);
+                        self.write_expr_adj(*callee, adjustments);
                         res
                     }
                     None => (Vec::new(), self.err_ty()),
                 };
+                let indices_to_skip = self.check_legacy_const_generics(derefed_callee, args);
                 self.register_obligations_for_call(&callee_ty);
 
                 let expected_inputs = self.expected_inputs_for_expected_output(
@@ -345,7 +305,7 @@ impl<'a> InferenceContext<'a> {
                     param_tys.clone(),
                 );
 
-                self.check_call_arguments(args, &expected_inputs, &param_tys);
+                self.check_call_arguments(args, &expected_inputs, &param_tys, &indices_to_skip);
                 self.normalize_associated_types_in(ret_ty)
             }
             Expr::MethodCall { receiver, args, method_name, generic_args } => self
@@ -378,20 +338,11 @@ impl<'a> InferenceContext<'a> {
                 for arm in arms.iter() {
                     self.diverges = Diverges::Maybe;
                     let _pat_ty = self.infer_pat(arm.pat, &input_ty, BindingMode::default());
-                    match arm.guard {
-                        Some(MatchGuard::If { expr: guard_expr }) => {
-                            self.infer_expr(
-                                guard_expr,
-                                &Expectation::has_type(
-                                    TyKind::Scalar(Scalar::Bool).intern(Interner),
-                                ),
-                            );
-                        }
-                        Some(MatchGuard::IfLet { expr, pat }) => {
-                            let input_ty = self.infer_expr(expr, &Expectation::none());
-                            let _pat_ty = self.infer_pat(pat, &input_ty, BindingMode::default());
-                        }
-                        _ => {}
+                    if let Some(guard_expr) = arm.guard {
+                        self.infer_expr(
+                            guard_expr,
+                            &Expectation::has_type(TyKind::Scalar(Scalar::Bool).intern(Interner)),
+                        );
                     }
 
                     let arm_ty = self.infer_expr_inner(arm.expr, &expected);
@@ -496,78 +447,67 @@ impl<'a> InferenceContext<'a> {
             }
             Expr::Field { expr, name } => {
                 let receiver_ty = self.infer_expr_inner(*expr, &Expectation::none());
-                let canonicalized = self.canonicalize(receiver_ty);
 
-                let mut autoderef = Autoderef::new(
-                    self.db,
-                    self.resolver.krate(),
-                    InEnvironment {
-                        goal: canonicalized.value.clone(),
-                        environment: self.trait_env.env.clone(),
-                    },
-                );
+                let mut autoderef = Autoderef::new(&mut self.table, receiver_ty);
                 let ty = autoderef.by_ref().find_map(|(derefed_ty, _)| {
-                    let module = self.resolver.module();
-                    let db = self.db;
-                    let is_visible = |field_id: &FieldId| {
-                        module
-                            .map(|mod_id| {
-                                db.field_visibilities(field_id.parent)[field_id.local_id]
-                                    .is_visible_from(db.upcast(), mod_id)
-                            })
-                            .unwrap_or(true)
-                    };
-                    match canonicalized
-                        .decanonicalize_ty(&mut self.table, derefed_ty)
-                        .kind(Interner)
-                    {
-                        TyKind::Tuple(_, substs) => name.as_tuple_index().and_then(|idx| {
-                            substs
-                                .as_slice(Interner)
-                                .get(idx)
-                                .map(|a| a.assert_ty_ref(Interner))
-                                .cloned()
-                        }),
+                    let (field_id, parameters) = match derefed_ty.kind(Interner) {
+                        TyKind::Tuple(_, substs) => {
+                            return name.as_tuple_index().and_then(|idx| {
+                                substs
+                                    .as_slice(Interner)
+                                    .get(idx)
+                                    .map(|a| a.assert_ty_ref(Interner))
+                                    .cloned()
+                            });
+                        }
                         TyKind::Adt(AdtId(hir_def::AdtId::StructId(s)), parameters) => {
                             let local_id = self.db.struct_data(*s).variant_data.field(name)?;
                             let field = FieldId { parent: (*s).into(), local_id };
-                            if is_visible(&field) {
-                                self.write_field_resolution(tgt_expr, field);
-                                Some(
-                                    self.db.field_types((*s).into())[field.local_id]
-                                        .clone()
-                                        .substitute(Interner, &parameters),
-                                )
-                            } else {
-                                None
-                            }
+                            (field, parameters.clone())
                         }
                         TyKind::Adt(AdtId(hir_def::AdtId::UnionId(u)), parameters) => {
                             let local_id = self.db.union_data(*u).variant_data.field(name)?;
                             let field = FieldId { parent: (*u).into(), local_id };
-                            if is_visible(&field) {
-                                self.write_field_resolution(tgt_expr, field);
-                                Some(
-                                    self.db.field_types((*u).into())[field.local_id]
-                                        .clone()
-                                        .substitute(Interner, &parameters),
-                                )
-                            } else {
-                                None
-                            }
+                            (field, parameters.clone())
                         }
-                        _ => None,
+                        _ => return None,
+                    };
+                    let module = self.resolver.module();
+                    let is_visible = module
+                        .map(|mod_id| {
+                            self.db.field_visibilities(field_id.parent)[field_id.local_id]
+                                .is_visible_from(self.db.upcast(), mod_id)
+                        })
+                        .unwrap_or(true);
+                    if !is_visible {
+                        // Write down the first field resolution even if it is not visible
+                        // This aids IDE features for private fields like goto def and in
+                        // case of autoderef finding an applicable field, this will be
+                        // overwritten in a following cycle
+                        if let Entry::Vacant(entry) = self.result.field_resolutions.entry(tgt_expr)
+                        {
+                            entry.insert(field_id);
+                        }
+                        return None;
                     }
+                    // can't have `write_field_resolution` here because `self.table` is borrowed :(
+                    self.result.field_resolutions.insert(tgt_expr, field_id);
+                    let ty = self.db.field_types(field_id.parent)[field_id.local_id]
+                        .clone()
+                        .substitute(Interner, &parameters);
+                    Some(ty)
                 });
                 let ty = match ty {
                     Some(ty) => {
-                        self.write_expr_adj(*expr, self.auto_deref_adjust_steps(&autoderef));
+                        let adjustments = auto_deref_adjust_steps(&autoderef);
+                        self.write_expr_adj(*expr, adjustments);
+                        let ty = self.insert_type_vars(ty);
+                        let ty = self.normalize_associated_types_in(ty);
                         ty
                     }
-                    None => self.err_ty(),
+                    _ => self.err_ty(),
                 };
-                let ty = self.insert_type_vars(ty);
-                self.normalize_associated_types_in(ty)
+                ty
             }
             Expr::Await { expr } => {
                 let inner_ty = self.infer_expr_inner(*expr, &Expectation::none());
@@ -625,25 +565,9 @@ impl<'a> InferenceContext<'a> {
                 let inner_ty = self.infer_expr_inner(*expr, &Expectation::none());
                 let inner_ty = self.resolve_ty_shallow(&inner_ty);
                 match op {
-                    UnaryOp::Deref => match self.resolver.krate() {
-                        Some(krate) => {
-                            let canonicalized = self.canonicalize(inner_ty);
-                            match autoderef::deref(
-                                self.db,
-                                krate,
-                                InEnvironment {
-                                    goal: &canonicalized.value,
-                                    environment: self.trait_env.env.clone(),
-                                },
-                            ) {
-                                Some(derefed_ty) => {
-                                    canonicalized.decanonicalize_ty(&mut self.table, derefed_ty)
-                                }
-                                None => self.err_ty(),
-                            }
-                        }
-                        None => self.err_ty(),
-                    },
+                    UnaryOp::Deref => {
+                        autoderef::deref(&mut self.table, inner_ty).unwrap_or_else(|| self.err_ty())
+                    }
                     UnaryOp::Neg => {
                         match inner_ty.kind(Interner) {
                             // Fast path for builtins
@@ -729,24 +653,23 @@ impl<'a> InferenceContext<'a> {
                 let base_ty = self.infer_expr_inner(*base, &Expectation::none());
                 let index_ty = self.infer_expr(*index, &Expectation::none());
 
-                if let (Some(index_trait), Some(krate)) =
-                    (self.resolve_ops_index(), self.resolver.krate())
-                {
-                    let canonicalized = self.canonicalize(base_ty);
-                    let self_ty = method_resolution::resolve_indexing_op(
+                if let Some(index_trait) = self.resolve_ops_index() {
+                    let canonicalized = self.canonicalize(base_ty.clone());
+                    let receiver_adjustments = method_resolution::resolve_indexing_op(
                         self.db,
-                        &canonicalized.value,
                         self.trait_env.clone(),
-                        krate,
+                        canonicalized.value,
                         index_trait,
                     );
-                    let self_ty = self_ty.map_or(self.err_ty(), |t| {
-                        canonicalized.decanonicalize_ty(&mut self.table, t)
-                    });
+                    let (self_ty, adj) = receiver_adjustments
+                        .map_or((self.err_ty(), Vec::new()), |adj| {
+                            adj.apply(&mut self.table, base_ty)
+                        });
+                    self.write_expr_adj(*base, adj);
                     self.resolve_associated_type_with_params(
                         self_ty,
                         self.resolve_ops_index_output(),
-                        &[index_ty],
+                        &[GenericArgData::Ty(index_ty).intern(Interner)],
                     )
                 } else {
                     self.err_ty()
@@ -788,7 +711,7 @@ impl<'a> InferenceContext<'a> {
                             let cur_elem_ty = self.infer_expr_inner(expr, &expected);
                             coerce.coerce(self, Some(expr), &cur_elem_ty);
                         }
-                        Some(items.len() as u64)
+                        consteval::usize_const(Some(items.len() as u64))
                     }
                     &Array::Repeat { initializer, repeat } => {
                         self.infer_expr_coerce(initializer, &Expectation::has_type(elem_ty));
@@ -799,19 +722,22 @@ impl<'a> InferenceContext<'a> {
                             ),
                         );
 
-                        consteval::eval_usize(
-                            repeat,
-                            consteval::ConstEvalCtx {
-                                exprs: &body.exprs,
-                                pats: &body.pats,
-                                local_data: Default::default(),
-                                infer: &mut |x| self.infer_expr(x, &expected),
-                            },
-                        )
+                        if let Some(g_def) = self.owner.as_generic_def_id() {
+                            let generics = generics(self.db.upcast(), g_def);
+                            consteval::eval_to_const(
+                                repeat,
+                                ParamLoweringMode::Placeholder,
+                                self,
+                                || generics,
+                                DebruijnIndex::INNERMOST,
+                            )
+                        } else {
+                            consteval::usize_const(None)
+                        }
                     }
                 };
 
-                TyKind::Array(coerce.complete(), consteval::usize_const(len)).intern(Interner)
+                TyKind::Array(coerce.complete(), len).intern(Interner)
             }
             Expr::Literal(lit) => match lit {
                 Literal::Bool(..) => TyKind::Scalar(Scalar::Bool).intern(Interner),
@@ -989,22 +915,20 @@ impl<'a> InferenceContext<'a> {
 
         let traits_in_scope = self.resolver.traits_in_scope(self.db.upcast());
 
-        let resolved = self.resolver.krate().and_then(|krate| {
-            method_resolution::lookup_method(
-                &canonicalized_receiver.value,
-                self.db,
-                self.trait_env.clone(),
-                krate,
-                &traits_in_scope,
-                self.resolver.module().into(),
-                method_name,
-            )
-        });
+        let resolved = method_resolution::lookup_method(
+            &canonicalized_receiver.value,
+            self.db,
+            self.trait_env.clone(),
+            &traits_in_scope,
+            self.resolver.module().into(),
+            method_name,
+        );
         let (receiver_ty, method_ty, substs) = match resolved {
-            Some((ty, func)) => {
-                let ty = canonicalized_receiver.decanonicalize_ty(&mut self.table, ty);
+            Some((adjust, func)) => {
+                let (ty, adjustments) = adjust.apply(&mut self.table, receiver_ty);
                 let generics = generics(self.db.upcast(), func.into());
-                let substs = self.substs_for_method_call(generics, generic_args, &ty);
+                let substs = self.substs_for_method_call(generics, generic_args);
+                self.write_expr_adj(receiver, adjustments);
                 self.write_method_resolution(tgt_expr, func, substs.clone());
                 (ty, self.db.value_ty(func.into()), substs)
             }
@@ -1031,7 +955,7 @@ impl<'a> InferenceContext<'a> {
         let expected_inputs =
             self.expected_inputs_for_expected_output(expected, ret_ty.clone(), param_tys.clone());
 
-        self.check_call_arguments(args, &expected_inputs, &param_tys);
+        self.check_call_arguments(args, &expected_inputs, &param_tys, &[]);
         self.normalize_associated_types_in(ret_ty)
     }
 
@@ -1062,21 +986,37 @@ impl<'a> InferenceContext<'a> {
         }
     }
 
-    fn check_call_arguments(&mut self, args: &[ExprId], expected_inputs: &[Ty], param_tys: &[Ty]) {
+    fn check_call_arguments(
+        &mut self,
+        args: &[ExprId],
+        expected_inputs: &[Ty],
+        param_tys: &[Ty],
+        skip_indices: &[u32],
+    ) {
         // Quoting https://github.com/rust-lang/rust/blob/6ef275e6c3cb1384ec78128eceeb4963ff788dca/src/librustc_typeck/check/mod.rs#L3325 --
         // We do this in a pretty awful way: first we type-check any arguments
         // that are not closures, then we type-check the closures. This is so
         // that we have more information about the types of arguments when we
         // type-check the functions. This isn't really the right way to do this.
         for &check_closures in &[false, true] {
+            let mut skip_indices = skip_indices.into_iter().copied().fuse().peekable();
             let param_iter = param_tys.iter().cloned().chain(repeat(self.err_ty()));
             let expected_iter = expected_inputs
                 .iter()
                 .cloned()
                 .chain(param_iter.clone().skip(expected_inputs.len()));
-            for ((&arg, param_ty), expected_ty) in args.iter().zip(param_iter).zip(expected_iter) {
+            for (idx, ((&arg, param_ty), expected_ty)) in
+                args.iter().zip(param_iter).zip(expected_iter).enumerate()
+            {
                 let is_closure = matches!(&self.body[arg], Expr::Lambda { .. });
                 if is_closure != check_closures {
+                    continue;
+                }
+
+                while skip_indices.peek().map_or(false, |i| *i < idx as u32) {
+                    skip_indices.next();
+                }
+                if skip_indices.peek().copied() == Some(idx as u32) {
                     continue;
                 }
 
@@ -1117,42 +1057,70 @@ impl<'a> InferenceContext<'a> {
         &mut self,
         def_generics: Generics,
         generic_args: Option<&GenericArgs>,
-        receiver_ty: &Ty,
     ) -> Substitution {
-        let (parent_params, self_params, type_params, impl_trait_params) =
+        let (parent_params, self_params, type_params, const_params, impl_trait_params) =
             def_generics.provenance_split();
         assert_eq!(self_params, 0); // method shouldn't have another Self param
-        let total_len = parent_params + type_params + impl_trait_params;
+        let total_len = parent_params + type_params + const_params + impl_trait_params;
         let mut substs = Vec::with_capacity(total_len);
-        // Parent arguments are unknown, except for the receiver type
-        for (_id, param) in def_generics.iter_parent() {
-            if param.provenance == hir_def::generics::TypeParamProvenance::TraitSelf {
-                substs.push(receiver_ty.clone());
-            } else {
-                substs.push(self.table.new_type_var());
+        // Parent arguments are unknown
+        for (id, param) in def_generics.iter_parent() {
+            match param {
+                TypeOrConstParamData::TypeParamData(_) => {
+                    substs.push(GenericArgData::Ty(self.table.new_type_var()).intern(Interner));
+                }
+                TypeOrConstParamData::ConstParamData(_) => {
+                    let ty = self.db.const_param_ty(ConstParamId::from_unchecked(id));
+                    substs
+                        .push(GenericArgData::Const(self.table.new_const_var(ty)).intern(Interner));
+                }
             }
         }
-        // handle provided type arguments
+        // handle provided arguments
         if let Some(generic_args) = generic_args {
             // if args are provided, it should be all of them, but we can't rely on that
-            for arg in generic_args
+            for (arg, kind_id) in generic_args
                 .args
                 .iter()
-                .filter(|arg| matches!(arg, GenericArg::Type(_)))
-                .take(type_params)
+                .filter(|arg| !matches!(arg, GenericArg::Lifetime(_)))
+                .take(type_params + const_params)
+                .zip(def_generics.iter_id().skip(parent_params))
             {
-                match arg {
-                    GenericArg::Type(type_ref) => {
-                        let ty = self.make_ty(type_ref);
-                        substs.push(ty);
-                    }
-                    GenericArg::Lifetime(_) => {}
+                if let Some(g) = generic_arg_to_chalk(
+                    self.db,
+                    kind_id,
+                    arg,
+                    self,
+                    |this, type_ref| this.make_ty(type_ref),
+                    |this, c| {
+                        const_or_path_to_chalk(
+                            this.db,
+                            &this.resolver,
+                            c,
+                            ParamLoweringMode::Placeholder,
+                            || generics(this.db.upcast(), (&this.resolver).generic_def().unwrap()),
+                            DebruijnIndex::INNERMOST,
+                        )
+                    },
+                ) {
+                    substs.push(g);
                 }
             }
         };
-        let supplied_params = substs.len();
-        for _ in supplied_params..total_len {
-            substs.push(self.table.new_type_var());
+        for (id, data) in def_generics.iter().skip(substs.len()) {
+            match data {
+                TypeOrConstParamData::TypeParamData(_) => {
+                    substs.push(GenericArgData::Ty(self.table.new_type_var()).intern(Interner))
+                }
+                TypeOrConstParamData::ConstParamData(_) => {
+                    substs.push(
+                        GenericArgData::Const(self.table.new_const_var(
+                            self.db.const_param_ty(ConstParamId::from_unchecked(id)),
+                        ))
+                        .intern(Interner),
+                    )
+                }
+            }
         }
         assert_eq!(substs.len(), total_len);
         Substitution::from_iter(Interner, substs)
@@ -1189,6 +1157,49 @@ impl<'a> InferenceContext<'a> {
                 CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {}
             }
         }
+    }
+
+    /// Returns the argument indices to skip.
+    fn check_legacy_const_generics(&mut self, callee: Ty, args: &[ExprId]) -> Vec<u32> {
+        let (func, subst) = match callee.kind(Interner) {
+            TyKind::FnDef(fn_id, subst) => {
+                let callable = CallableDefId::from_chalk(self.db, *fn_id);
+                let func = match callable {
+                    CallableDefId::FunctionId(f) => f,
+                    _ => return Vec::new(),
+                };
+                (func, subst)
+            }
+            _ => return Vec::new(),
+        };
+
+        let data = self.db.function_data(func);
+        if data.legacy_const_generics_indices.is_empty() {
+            return Vec::new();
+        }
+
+        // only use legacy const generics if the param count matches with them
+        if data.params.len() + data.legacy_const_generics_indices.len() != args.len() {
+            return Vec::new();
+        }
+
+        // check legacy const parameters
+        for (subst_idx, arg_idx) in data.legacy_const_generics_indices.iter().copied().enumerate() {
+            let arg = match subst.at(Interner, subst_idx).constant(Interner) {
+                Some(c) => c,
+                None => continue, // not a const parameter?
+            };
+            if arg_idx >= args.len() as u32 {
+                continue;
+            }
+            let _ty = arg.data(Interner).ty.clone();
+            let expected = Expectation::none(); // FIXME use actual const ty, when that is lowered correctly
+            self.infer_expr(args[arg_idx as usize], &expected);
+            // FIXME: evaluate and unify with the const
+        }
+        let mut indices = data.legacy_const_generics_indices.clone();
+        indices.sort();
+        indices
     }
 
     fn builtin_binary_op_return_ty(&mut self, op: BinaryOp, lhs_ty: Ty, rhs_ty: Ty) -> Option<Ty> {

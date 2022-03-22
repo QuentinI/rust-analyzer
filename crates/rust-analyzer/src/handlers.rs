@@ -275,9 +275,7 @@ pub(crate) fn handle_on_type_formatting(
     let char_typed = params.ch.chars().next().unwrap_or('\0');
 
     let text = snap.analysis.file_text(position.file_id)?;
-    if !text[usize::from(position.offset)..].starts_with(char_typed) {
-        // Add `always!` here once VS Code bug is fixed:
-        //   https://github.com/rust-analyzer/rust-analyzer/issues/10002
+    if stdx::never!(!text[usize::from(position.offset)..].starts_with(char_typed)) {
         return Ok(None);
     }
 
@@ -534,7 +532,7 @@ pub(crate) fn handle_will_rename_files(
     let mut source_change = source_changes.next().unwrap_or_default();
     source_change.file_system_edits.clear();
     // no collect here because we want to merge text edits on same file ids
-    source_change.extend(source_changes.map(|it| it.source_file_edits).flatten());
+    source_change.extend(source_changes.flat_map(|it| it.source_file_edits));
     if source_change.source_file_edits.is_empty() {
         Ok(None)
     } else {
@@ -897,13 +895,12 @@ pub(crate) fn handle_signature_help(
 ) -> Result<Option<lsp_types::SignatureHelp>> {
     let _p = profile::span("handle_signature_help");
     let position = from_proto::file_position(&snap, params.text_document_position_params)?;
-    let call_info = match snap.analysis.call_info(position)? {
+    let help = match snap.analysis.signature_help(position)? {
         Some(it) => it,
         None => return Ok(None),
     };
     let concise = !snap.config.call_info_full();
-    let res =
-        to_proto::signature_help(call_info, concise, snap.config.signature_help_label_offsets());
+    let res = to_proto::signature_help(help, concise, snap.config.signature_help_label_offsets());
     Ok(Some(res))
 }
 
@@ -1320,13 +1317,25 @@ pub(crate) fn handle_inlay_hints(
     params: InlayHintsParams,
 ) -> Result<Vec<InlayHint>> {
     let _p = profile::span("handle_inlay_hints");
-    let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
+    let document_uri = &params.text_document.uri;
+    let file_id = from_proto::file_id(&snap, document_uri)?;
     let line_index = snap.file_line_index(file_id)?;
+    let range = params
+        .range
+        .map(|range| {
+            from_proto::file_range(
+                &snap,
+                TextDocumentIdentifier::new(document_uri.to_owned()),
+                range,
+            )
+        })
+        .transpose()?;
+    let inlay_hints_config = snap.config.inlay_hints();
     Ok(snap
         .analysis
-        .inlay_hints(&snap.config.inlay_hints(), file_id)?
+        .inlay_hints(&inlay_hints_config, file_id, range)?
         .into_iter()
-        .map(|it| to_proto::inlay_hint(&line_index, it))
+        .map(|it| to_proto::inlay_hint(inlay_hints_config.render_colons, &line_index, it))
         .collect())
 }
 

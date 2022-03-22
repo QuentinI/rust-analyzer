@@ -463,18 +463,32 @@ fn main() {}
             partial_result_params: PartialResultParams::default(),
             work_done_progress_params: WorkDoneProgressParams::default(),
         },
-        json!([{
-            "edit": {
-              "documentChanges": [
-                {
-                  "kind": "create",
-                  "uri": "file:///[..]/src/bar.rs"
+        json!([
+            {
+                "title": "Create module",
+                "kind": "quickfix",
+                "edit": {
+                "documentChanges": [
+                    {
+                    "kind": "create",
+                    "uri": "file://[..]/src/bar.rs"
+                    }
+                ]
                 }
-              ]
             },
-            "kind": "quickfix",
-            "title": "Create module"
-        }]),
+            {
+                "title": "Create module",
+                "kind": "quickfix",
+                "edit": {
+                "documentChanges": [
+                    {
+                    "kind": "create",
+                    "uri": "file://[..]src/bar/mod.rs"
+                    }
+                ]
+                }
+            }
+        ]),
     );
 
     server.request::<CodeActionRequest>(
@@ -492,7 +506,7 @@ fn main() {}
 #[test]
 fn test_missing_module_code_action_in_json_project() {
     if skip_slow_tests() {
-        return;
+        // return;
     }
 
     let tmp_dir = TestDir::new();
@@ -519,7 +533,7 @@ mod bar;
 
 fn main() {{}}
 "#,
-        PROJECT = project.to_string(),
+        PROJECT = project,
     );
 
     let server =
@@ -533,18 +547,32 @@ fn main() {{}}
             partial_result_params: PartialResultParams::default(),
             work_done_progress_params: WorkDoneProgressParams::default(),
         },
-        json!([{
-            "edit": {
-              "documentChanges": [
-                {
-                  "kind": "create",
-                  "uri": "file://[..]/src/bar.rs"
+        json!([
+            {
+                "title": "Create module",
+                "kind": "quickfix",
+                "edit": {
+                "documentChanges": [
+                    {
+                    "kind": "create",
+                    "uri": "file://[..]/src/bar.rs"
+                    }
+                ]
                 }
-              ]
             },
-            "kind": "quickfix",
-            "title": "Create module"
-        }]),
+            {
+                "title": "Create module",
+                "kind": "quickfix",
+                "edit": {
+                "documentChanges": [
+                    {
+                    "kind": "create",
+                    "uri": "file://[..]src/bar/mod.rs"
+                    }
+                ]
+                }
+            }
+        ]),
     );
 
     server.request::<CodeActionRequest>(
@@ -944,7 +972,7 @@ fn main() {}
           "documentChanges": [
             {
               "textDocument": {
-                "uri": format!("file://{}", tmp_dir_path.join("src").join("lib.rs").to_str().unwrap().to_string().replace("C:\\", "/c:/").replace("\\", "/")),
+                "uri": format!("file://{}", tmp_dir_path.join("src").join("lib.rs").to_str().unwrap().to_string().replace("C:\\", "/c:/").replace('\\', "/")),
                 "version": null
               },
               "edits": [
@@ -1001,7 +1029,7 @@ fn main() {}
           "documentChanges": [
             {
               "textDocument": {
-                "uri": format!("file://{}", tmp_dir_path.join("src").join("lib.rs").to_str().unwrap().to_string().replace("C:\\", "/c:/").replace("\\", "/")),
+                "uri": format!("file://{}", tmp_dir_path.join("src").join("lib.rs").to_str().unwrap().to_string().replace("C:\\", "/c:/").replace('\\', "/")),
                 "version": null
               },
               "edits": [

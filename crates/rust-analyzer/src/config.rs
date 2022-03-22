@@ -12,10 +12,11 @@ use std::{ffi::OsString, iter, path::PathBuf};
 use flycheck::FlycheckConfig;
 use ide::{
     AssistConfig, CompletionConfig, DiagnosticsConfig, ExprFillDefaultMode, HighlightRelatedConfig,
-    HoverConfig, HoverDocFormat, InlayHintsConfig, JoinLinesConfig, Snippet, SnippetScope,
+    HoverConfig, HoverDocFormat, InlayHintsConfig, JoinLinesConfig, LifetimeElisionHints, Snippet,
+    SnippetScope,
 };
-use ide_db::helpers::{
-    insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
+use ide_db::{
+    imports::insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
     SnippetCap,
 };
 use lsp_types::{ClientCapabilities, MarkupKind};
@@ -161,13 +162,15 @@ config_data! {
             }
         }"#,
         /// Whether to show postfix snippets like `dbg`, `if`, `not`, etc.
-        completion_postfix_enable: bool          = "true",
+        completion_postfix_enable: bool         = "true",
         /// Toggles the additional completions that automatically add imports when completed.
         /// Note that your client must specify the `additionalTextEdits` LSP client capability to truly have this feature enabled.
         completion_autoimport_enable: bool       = "true",
         /// Toggles the additional completions that automatically show method calls and field accesses
         /// with `self` prefixed to them when inside a method.
-        completion_autoself_enable: bool       = "true",
+        completion_autoself_enable: bool        = "true",
+        /// Enables completions of private items and fields that are defined in the current workspace even if they are not visible at the current position.
+        completion_privateEditable_enable: bool = "false",
 
         /// Whether to show native rust-analyzer diagnostics.
         diagnostics_enable: bool                = "true",
@@ -240,17 +243,27 @@ config_data! {
         /// `#rust-analyzer.hoverActions.enable#` is set.
         hoverActions_run: bool             = "true",
 
-        /// Whether to show inlay type hints for method chains.
-        inlayHints_chainingHints: bool              = "true",
+        /// Whether to render trailing colons for parameter hints, and trailing colons for parameter hints.
+        inlayHints_renderColons: bool                      = "true",
         /// Maximum length for inlay hints. Set to null to have an unlimited length.
-        inlayHints_maxLength: Option<usize>         = "25",
+        inlayHints_maxLength: Option<usize>                = "25",
         /// Whether to show function parameter name inlay hints at the call
         /// site.
-        inlayHints_parameterHints: bool             = "true",
+        inlayHints_parameterHints: bool                     = "true",
         /// Whether to show inlay type hints for variables.
-        inlayHints_typeHints: bool                  = "true",
+        inlayHints_typeHints: bool                          = "true",
+        /// Whether to show inlay type hints for method chains.
+        inlayHints_chainingHints: bool                      = "true",
+        /// Whether to show inlay type hints for return types of closures with blocks.
+        inlayHints_closureReturnTypeHints: bool             = "false",
+        /// Whether to show inlay type hints for compiler inserted reborrows.
+        inlayHints_reborrowHints: bool                      = "false",
+        /// Whether to show inlay type hints for elided lifetimes in function signatures.
+        inlayHints_lifetimeElisionHints: LifetimeElisionDef = "\"never\"",
+        /// Whether to prefer using parameter names as the name for elided lifetime hints if possible.
+        inlayHints_lifetimeElisionHints_useParameterNames: bool  = "false",
         /// Whether to hide inlay hints for constructors.
-        inlayHints_hideNamedConstructorHints: bool  = "false",
+        inlayHints_hideNamedConstructorHints: bool          = "false",
 
         /// Join lines inserts else between consecutive ifs.
         joinLines_joinElseIf: bool = "true",
@@ -844,10 +857,21 @@ impl Config {
     }
     pub fn inlay_hints(&self) -> InlayHintsConfig {
         InlayHintsConfig {
+            render_colons: self.data.inlayHints_renderColons,
             type_hints: self.data.inlayHints_typeHints,
             parameter_hints: self.data.inlayHints_parameterHints,
             chaining_hints: self.data.inlayHints_chainingHints,
+            closure_return_type_hints: self.data.inlayHints_closureReturnTypeHints,
+            lifetime_elision_hints: match self.data.inlayHints_lifetimeElisionHints {
+                LifetimeElisionDef::Always => LifetimeElisionHints::Always,
+                LifetimeElisionDef::Never => LifetimeElisionHints::Never,
+                LifetimeElisionDef::SkipTrivial => LifetimeElisionHints::SkipTrivial,
+            },
             hide_named_constructor_hints: self.data.inlayHints_hideNamedConstructorHints,
+            reborrow_hints: self.data.inlayHints_reborrowHints,
+            param_names_for_lifetime_elision_hints: self
+                .data
+                .inlayHints_lifetimeElisionHints_useParameterNames,
             max_length: self.data.inlayHints_maxLength,
         }
     }
@@ -875,6 +899,7 @@ impl Config {
             enable_imports_on_the_fly: self.data.completion_autoimport_enable
                 && completion_item_edit_resolve(&self.caps),
             enable_self_on_the_fly: self.data.completion_autoself_enable,
+            enable_private_editable: self.data.completion_privateEditable_enable,
             add_call_parenthesis: self.data.completion_addCallParenthesis,
             add_call_argument_snippets: self.data.completion_addCallArgumentSnippets,
             insert_use: self.insert_use_config(),
@@ -1118,6 +1143,16 @@ enum ImportGranularityDef {
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
+enum LifetimeElisionDef {
+    #[serde(alias = "true")]
+    Always,
+    #[serde(alias = "false")]
+    Never,
+    SkipTrivial,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
 enum ImportPrefixDef {
     Plain,
     #[serde(alias = "self")]
@@ -1232,7 +1267,7 @@ fn schema(fields: &[(&'static str, &'static str, &[&str], &str)]) -> serde_json:
     let map = fields
         .iter()
         .map(|(field, ty, doc, default)| {
-            let name = field.replace("_", ".");
+            let name = field.replace('_', ".");
             let name = format!("rust-analyzer.{}", name);
             let props = field_props(field, ty, doc, default);
             (name, props)
@@ -1368,7 +1403,16 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
             "minimum": 0,
             "maximum": 255
         },
-        _ => panic!("{}: {}", ty, default),
+        "LifetimeElisionDef" => set! {
+            "type": "string",
+            "enum": ["always", "never", "skip_trivial"],
+            "enumDescriptions": [
+                "Always show lifetime elision hints.",
+                "Never show lifetime elision hints.",
+                "Only show lifetime elision hints if a return type is involved."
+            ],
+        },
+        _ => panic!("missing entry for {}: {}", ty, default),
     }
 
     map.into()
@@ -1379,7 +1423,7 @@ fn manual(fields: &[(&'static str, &'static str, &[&str], &str)]) -> String {
     fields
         .iter()
         .map(|(field, _ty, doc, default)| {
-            let name = format!("rust-analyzer.{}", field.replace("_", "."));
+            let name = format!("rust-analyzer.{}", field.replace('_', "."));
             let doc = doc_comment_to_string(*doc);
             if default.contains('\n') {
                 format!(
@@ -1422,7 +1466,7 @@ mod tests {
             .trim_start_matches('{')
             .trim_end_matches('}')
             .replace("  ", "    ")
-            .replace("\n", "\n            ")
+            .replace('\n', "\n            ")
             .trim_start_matches('\n')
             .trim_end()
             .to_string();

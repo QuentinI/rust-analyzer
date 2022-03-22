@@ -1109,6 +1109,59 @@ pub mod foo$0;
     }
 
     #[test]
+    fn test_rename_mod_ref_by_super() {
+        check(
+            "baz",
+            r#"
+        mod $0foo {
+        struct X;
+
+        mod bar {
+            use super::X;
+        }
+    }
+            "#,
+            r#"
+        mod baz {
+        struct X;
+
+        mod bar {
+            use super::X;
+        }
+    }
+            "#,
+        )
+    }
+
+    #[test]
+    fn test_rename_mod_in_macro() {
+        check(
+            "bar",
+            r#"
+//- /foo.rs
+
+//- /lib.rs
+macro_rules! submodule {
+    ($name:ident) => {
+        mod $name;
+    };
+}
+
+submodule!($0foo);
+"#,
+            r#"
+macro_rules! submodule {
+    ($name:ident) => {
+        mod $name;
+    };
+}
+
+submodule!(bar);
+"#,
+        )
+    }
+
+    #[test]
     fn test_enum_variant_from_module_1() {
         cov_mark::check!(rename_non_local);
         check(
@@ -2030,5 +2083,54 @@ fn foo() {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn rename_multi_local() {
+        check(
+            "bar",
+            r#"
+fn foo((foo$0 | foo | foo): ()) {
+    foo;
+    let foo;
+}
+"#,
+            r#"
+fn foo((bar | bar | bar): ()) {
+    bar;
+    let foo;
+}
+"#,
+        );
+        check(
+            "bar",
+            r#"
+fn foo((foo | foo$0 | foo): ()) {
+    foo;
+    let foo;
+}
+"#,
+            r#"
+fn foo((bar | bar | bar): ()) {
+    bar;
+    let foo;
+}
+"#,
+        );
+        check(
+            "bar",
+            r#"
+fn foo((foo | foo | foo): ()) {
+    foo$0;
+    let foo;
+}
+"#,
+            r#"
+fn foo((bar | bar | bar): ()) {
+    bar;
+    let foo;
+}
+"#,
+        );
     }
 }

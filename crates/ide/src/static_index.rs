@@ -12,10 +12,13 @@ use ide_db::{
 use rustc_hash::FxHashSet;
 use syntax::{AstNode, SyntaxKind::*, SyntaxToken, TextRange, T};
 
-use crate::moniker::{crate_for_file, def_to_moniker, MonikerResult};
 use crate::{
     hover::hover_for_definition, Analysis, Fold, HoverConfig, HoverDocFormat, HoverResult,
     InlayHint, InlayHintsConfig, TryToNav,
+};
+use crate::{
+    moniker::{crate_for_file, def_to_moniker, MonikerResult},
+    LifetimeElisionHints,
 };
 
 /// A static representation of fully analyzed source code.
@@ -105,13 +108,19 @@ impl StaticIndex<'_> {
             .analysis
             .inlay_hints(
                 &InlayHintsConfig {
+                    render_colons: true,
                     type_hints: true,
                     parameter_hints: true,
                     chaining_hints: true,
+                    closure_return_type_hints: true,
+                    lifetime_elision_hints: LifetimeElisionHints::Never,
+                    reborrow_hints: false,
                     hide_named_constructor_hints: false,
+                    param_names_for_lifetime_elision_hints: false,
                     max_length: Some(25),
                 },
                 file_id,
+                None,
             )
             .unwrap();
         // hovers
@@ -126,7 +135,7 @@ impl StaticIndex<'_> {
         let tokens = tokens.filter(|token| {
             matches!(
                 token.kind(),
-                IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate]
+                IDENT | INT_NUMBER | LIFETIME_IDENT | T![self] | T![super] | T![crate] | T![Self]
             )
         });
         let mut result = StaticIndexedFile { file_id, inlay_hints, folds, tokens: vec![] };

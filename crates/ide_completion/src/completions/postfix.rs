@@ -3,10 +3,7 @@
 mod format_like;
 
 use hir::{Documentation, HasAttrs};
-use ide_db::{
-    helpers::{insert_use::ImportScope, SnippetCap},
-    ty_filter::TryEnum,
-};
+use ide_db::{imports::insert_use::ImportScope, ty_filter::TryEnum, SnippetCap};
 use syntax::{
     ast::{self, AstNode, AstToken},
     SyntaxKind::{EXPR_STMT, STMT_LIST},
@@ -54,7 +51,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
         None => return,
     };
 
-    let postfix_snippet = match build_postfix_snippet_builder(ctx, cap, &dot_receiver) {
+    let postfix_snippet = match build_postfix_snippet_builder(ctx, cap, dot_receiver) {
         Some(it) => it,
         None => return,
     };
@@ -268,7 +265,7 @@ fn add_custom_postfix_completions(
                 Some(imports) => imports,
                 None => return,
             };
-            let body = snippet.postfix_snippet(&receiver_text);
+            let body = snippet.postfix_snippet(receiver_text);
             let mut builder =
                 postfix_snippet(trigger, snippet.description.as_deref().unwrap_or_default(), &body);
             builder.documentation(Documentation::new(format!("```rust\n{}\n```", body)));

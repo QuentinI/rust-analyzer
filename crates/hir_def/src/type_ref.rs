@@ -1,9 +1,12 @@
 //! HIR for references to types. Paths in these are not yet resolved. They can
 //! be directly created from an ast::TypeRef, without further queries.
 
-use hir_expand::{name::Name, AstId, InFile};
-use std::convert::TryInto;
-use syntax::ast;
+use hir_expand::{
+    name::{AsName, Name},
+    AstId, InFile,
+};
+use std::{convert::TryInto, fmt::Write};
+use syntax::ast::{self, HasName};
 
 use crate::{body::LowerCtx, intern::Interned, path::Path};
 
@@ -34,6 +37,22 @@ impl Mutability {
             Mutability::Shared => "const ",
             Mutability::Mut => "mut ",
         }
+    }
+
+    /// Returns `true` if the mutability is [`Mut`].
+    ///
+    /// [`Mut`]: Mutability::Mut
+    #[must_use]
+    pub fn is_mut(&self) -> bool {
+        matches!(self, Self::Mut)
+    }
+
+    /// Returns `true` if the mutability is [`Shared`].
+    ///
+    /// [`Shared`]: Mutability::Shared
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared)
     }
 }
 
@@ -86,10 +105,10 @@ pub enum TypeRef {
     Reference(Box<TypeRef>, Option<LifetimeRef>, Mutability),
     // FIXME: for full const generics, the latter element (length) here is going to have to be an
     // expression that is further lowered later in hir_ty.
-    Array(Box<TypeRef>, ConstScalar),
+    Array(Box<TypeRef>, ConstScalarOrPath),
     Slice(Box<TypeRef>),
     /// A fn pointer. Last element of the vector is the return type.
-    Fn(Vec<TypeRef>, bool /*varargs*/),
+    Fn(Vec<(Option<Name>, TypeRef)>, bool /*varargs*/),
     // For
     ImplTrait(Vec<Interned<TypeBound>>),
     DynTrait(Vec<Interned<TypeBound>>),
@@ -159,10 +178,7 @@ impl TypeRef {
                 // `hir_def::body::lower` to lower this into an `Expr` and then evaluate it at the
                 // `hir_ty` level, which would allow knowing the type of:
                 // let v: [u8; 2 + 2] = [0u8; 4];
-                let len = inner
-                    .expr()
-                    .map(ConstScalar::usize_from_literal_expr)
-                    .unwrap_or(ConstScalar::Unknown);
+                let len = ConstScalarOrPath::from_expr_opt(inner.expr());
 
                 TypeRef::Array(Box::new(TypeRef::from_ast_opt(ctx, inner.ty())), len)
             }
@@ -188,11 +204,22 @@ impl TypeRef {
                         is_varargs = param.dotdotdot_token().is_some();
                     }
 
-                    pl.params().map(|p| p.ty()).map(|it| TypeRef::from_ast_opt(ctx, it)).collect()
+                    pl.params()
+                        .map(|it| {
+                            let type_ref = TypeRef::from_ast_opt(ctx, it.ty());
+                            let name = match it.pat() {
+                                Some(ast::Pat::IdentPat(it)) => Some(
+                                    it.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing),
+                                ),
+                                _ => None,
+                            };
+                            (name, type_ref)
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 };
-                params.push(ret_ty);
+                params.push((None, ret_ty));
                 TypeRef::Fn(params, is_varargs)
             }
             // for types are close enough for our purposes to the inner type for now...
@@ -230,9 +257,10 @@ impl TypeRef {
         fn go(type_ref: &TypeRef, f: &mut impl FnMut(&TypeRef)) {
             f(type_ref);
             match type_ref {
-                TypeRef::Fn(types, _) | TypeRef::Tuple(types) => {
-                    types.iter().for_each(|t| go(t, f))
+                TypeRef::Fn(params, _) => {
+                    params.iter().for_each(|(_, param_type)| go(param_type, f))
                 }
+                TypeRef::Tuple(types) => types.iter().for_each(|t| go(t, f)),
                 TypeRef::RawPtr(type_ref, _)
                 | TypeRef::Reference(type_ref, ..)
                 | TypeRef::Array(type_ref, _)
@@ -263,7 +291,8 @@ impl TypeRef {
                             crate::path::GenericArg::Type(type_ref) => {
                                 go(type_ref, f);
                             }
-                            crate::path::GenericArg::Lifetime(_) => {}
+                            crate::path::GenericArg::Const(_)
+                            | crate::path::GenericArg::Lifetime(_) => {}
                         }
                     }
                     for binding in &args_and_bindings.bindings {
@@ -342,6 +371,60 @@ impl TypeBound {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConstScalarOrPath {
+    Scalar(ConstScalar),
+    Path(Name),
+}
+
+impl std::fmt::Display for ConstScalarOrPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConstScalarOrPath::Scalar(s) => s.fmt(f),
+            ConstScalarOrPath::Path(n) => n.fmt(f),
+        }
+    }
+}
+
+impl ConstScalarOrPath {
+    pub(crate) fn from_expr_opt(expr: Option<ast::Expr>) -> Self {
+        match expr {
+            Some(x) => Self::from_expr(x),
+            None => Self::Scalar(ConstScalar::Unknown),
+        }
+    }
+
+    // FIXME: as per the comments on `TypeRef::Array`, this evaluation should not happen at this
+    // parse stage.
+    fn from_expr(expr: ast::Expr) -> Self {
+        match expr {
+            ast::Expr::PathExpr(p) => {
+                match p.path().and_then(|x| x.segment()).and_then(|x| x.name_ref()) {
+                    Some(x) => Self::Path(x.as_name()),
+                    None => Self::Scalar(ConstScalar::Unknown),
+                }
+            }
+            ast::Expr::Literal(lit) => {
+                let lkind = lit.kind();
+                match lkind {
+                    ast::LiteralKind::IntNumber(num)
+                        if num.suffix() == None || num.suffix() == Some("usize") =>
+                    {
+                        Self::Scalar(
+                            num.value()
+                                .and_then(|v| v.try_into().ok())
+                                .map(ConstScalar::Usize)
+                                .unwrap_or(ConstScalar::Unknown),
+                        )
+                    }
+                    _ => Self::Scalar(ConstScalar::Unknown),
+                }
+            }
+            _ => Self::Scalar(ConstScalar::Unknown),
+        }
+    }
+}
+
 /// A concrete constant value
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConstScalar {
@@ -358,10 +441,10 @@ pub enum ConstScalar {
 }
 
 impl std::fmt::Display for ConstScalar {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         match self {
-            ConstScalar::Usize(us) => write!(fmt, "{}", us),
-            ConstScalar::Unknown => write!(fmt, "_"),
+            ConstScalar::Usize(us) => us.fmt(f),
+            ConstScalar::Unknown => f.write_char('_'),
         }
     }
 }
@@ -373,26 +456,5 @@ impl ConstScalar {
             &ConstScalar::Usize(us) => Some(us),
             _ => None,
         }
-    }
-
-    // FIXME: as per the comments on `TypeRef::Array`, this evaluation should not happen at this
-    // parse stage.
-    fn usize_from_literal_expr(expr: ast::Expr) -> ConstScalar {
-        match expr {
-            ast::Expr::Literal(lit) => {
-                let lkind = lit.kind();
-                match lkind {
-                    ast::LiteralKind::IntNumber(num)
-                        if num.suffix() == None || num.suffix() == Some("usize") =>
-                    {
-                        num.value().and_then(|v| v.try_into().ok())
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-        .map(ConstScalar::Usize)
-        .unwrap_or(ConstScalar::Unknown)
     }
 }

@@ -92,6 +92,16 @@ fn quux() {
 "#,
         expect![[r#""#]],
     );
+    check_empty(
+        r#"
+fn foo() {
+    for &$0 in () {}
+}
+"#,
+        expect![[r#"
+            kw mut
+        "#]],
+    );
 }
 
 #[test]
@@ -102,7 +112,7 @@ fn foo() {
     if let a$0
 }
 "#,
-        expect![[r##"
+        expect![[r#"
             kw ref
             kw mut
             en Enum
@@ -112,11 +122,11 @@ fn foo() {
             st Tuple
             md module
             st Unit
-            ma makro!(…) #[macro_export] macro_rules! makro
+            ma makro!(…) macro_rules! makro
             bn TupleV    TupleV($1)$0
             ev TupleV
             ct CONST
-        "##]],
+        "#]],
     );
 }
 
@@ -132,7 +142,7 @@ fn foo() {
    let a$0
 }
 "#,
-        expect![[r##"
+        expect![[r#"
             kw ref
             kw mut
             bn Record            Record { field$1 }$0
@@ -140,10 +150,11 @@ fn foo() {
             bn Tuple             Tuple($1)$0
             st Tuple
             ev Variant
+            md module
             en SingleVariantEnum
             st Unit
-            ma makro!(…)         #[macro_export] macro_rules! makro
-        "##]],
+            ma makro!(…)         macro_rules! makro
+        "#]],
     );
 }
 
@@ -154,32 +165,34 @@ fn in_param() {
 fn foo(a$0) {
 }
 "#,
-        expect![[r##"
+        expect![[r#"
             kw ref
             kw mut
             bn Record    Record { field$1 }: Record$0
             st Record
             bn Tuple     Tuple($1): Tuple$0
             st Tuple
+            md module
             st Unit
-            ma makro!(…) #[macro_export] macro_rules! makro
-        "##]],
+            ma makro!(…) macro_rules! makro
+        "#]],
     );
     check(
         r#"
 fn foo(a$0: Tuple) {
 }
 "#,
-        expect![[r##"
+        expect![[r#"
             kw ref
             kw mut
             bn Record    Record { field$1 }$0
             st Record
             bn Tuple     Tuple($1)$0
             st Tuple
+            md module
             st Unit
-            ma makro!(…) #[macro_export] macro_rules! makro
-        "##]],
+            ma makro!(…) macro_rules! makro
+        "#]],
     );
 }
 
@@ -218,7 +231,6 @@ fn foo() {
         expect![[r#"
             kw ref
             kw mut
-            ev E::X  ()
             en E
             ma m!(…) macro_rules! m
         "#]],
@@ -291,9 +303,10 @@ fn func() {
 }
 "#,
         expect![[r#"
-            ev TupleV(…) (u32)
-            ev RecordV   {field: u32}
-            ev UnitV     ()
+            ev TupleV(…)   TupleV(u32)
+            ev RecordV {…} RecordV { field: u32 }
+            ev UnitV       UnitV
+            ct ASSOC_CONST const ASSOC_CONST: ()
         "#]],
     );
 }
@@ -367,4 +380,161 @@ fn foo() {
             st Bar
         "#]],
     )
+}
+
+#[test]
+fn completes_no_delims_if_existing() {
+    check_empty(
+        r#"
+struct Bar(u32);
+fn foo() {
+    match Bar(0) {
+        B$0(b) => {}
+    }
+}
+"#,
+        expect![[r#"
+            kw self::
+            kw super::
+            kw crate::
+        "#]],
+    );
+    check_empty(
+        r#"
+struct Foo { bar: u32 }
+fn foo() {
+    match Foo { bar: 0 } {
+        F$0 { bar } => {}
+    }
+}
+"#,
+        expect![[r#"
+            kw return
+            kw self
+            kw super
+            kw crate
+            st Foo
+            fn foo()  fn()
+            bt u32
+        "#]],
+    );
+    check_empty(
+        r#"
+enum Enum {
+    TupleVariant(u32)
+}
+fn foo() {
+    match Enum::TupleVariant(0) {
+        Enum::T$0(b) => {}
+    }
+}
+"#,
+        expect![[r#"
+            ev TupleVariant(…) TupleVariant
+        "#]],
+    );
+    check_empty(
+        r#"
+enum Enum {
+    RecordVariant { field: u32 }
+}
+fn foo() {
+    match (Enum::RecordVariant { field: 0 }) {
+        Enum::RecordV$0 { field } => {}
+    }
+}
+"#,
+        expect![[r#"
+            ev RecordVariant {…} RecordVariant
+        "#]],
+    );
+}
+
+#[test]
+fn completes_associated_const() {
+    check_empty(
+        r#"
+#[derive(PartialEq, Eq)]
+struct Ty(u8);
+
+impl Ty {
+    const ABC: Self = Self(0);
+}
+
+fn f(t: Ty) {
+    match t {
+        Ty::$0 => {}
+        _ => {}
+    }
+}
+"#,
+        expect![[r#"
+            ct ABC const ABC: Self
+        "#]],
+    );
+
+    check_empty(
+        r#"
+enum MyEnum {}
+
+impl MyEnum {
+    pub const A: i32 = 123;
+    pub const B: i32 = 456;
+}
+
+fn f(e: MyEnum) {
+    match e {
+        MyEnum::$0 => {}
+        _ => {}
+    }
+}
+"#,
+        expect![[r#"
+            ct A pub const A: i32
+            ct B pub const B: i32
+        "#]],
+    );
+
+    check_empty(
+        r#"
+union U {
+    i: i32,
+    f: f32,
+}
+
+impl U {
+    pub const C: i32 = 123;
+    pub const D: i32 = 456;
+}
+
+fn f(u: U) {
+    match u {
+        U::$0 => {}
+        _ => {}
+    }
+}
+"#,
+        expect![[r#"
+            ct C pub const C: i32
+            ct D pub const D: i32
+        "#]],
+    );
+
+    check_empty(
+        r#"
+#[lang = "u32"]
+impl u32 {
+    pub const MIN: Self = 0;
+}
+
+fn f(v: u32) {
+    match v {
+        u32::$0
+    }
+}
+        "#,
+        expect![[r#"
+            ct MIN pub const MIN: Self
+        "#]],
+    );
 }

@@ -233,6 +233,7 @@ pub mod known {
         column,
         compile_error,
         concat_idents,
+        concat_bytes,
         concat,
         const_format_args,
         core_panic,
@@ -252,6 +253,7 @@ pub mod known {
         std_panic,
         stringify,
         trace_macros,
+        unreachable,
         // Builtin derives
         Copy,
         Clone,
@@ -266,6 +268,7 @@ pub mod known {
         bench,
         cfg_accessible,
         cfg_eval,
+        crate_type,
         derive,
         global_allocator,
         test,

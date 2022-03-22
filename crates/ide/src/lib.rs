@@ -24,7 +24,7 @@ mod navigation_target;
 
 mod annotations;
 mod call_hierarchy;
-mod call_info;
+mod signature_help;
 mod doc_links;
 mod highlight_related;
 mod expand_macro;
@@ -75,13 +75,12 @@ use crate::navigation_target::{ToNav, TryToNav};
 pub use crate::{
     annotations::{Annotation, AnnotationConfig, AnnotationKind},
     call_hierarchy::CallItem,
-    call_info::CallInfo,
     expand_macro::ExpandedMacro,
     file_structure::{StructureNode, StructureNodeKind},
     folding_ranges::{Fold, FoldKind},
     highlight_related::{HighlightRelatedConfig, HighlightedRange},
     hover::{HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult},
-    inlay_hints::{InlayHint, InlayHintsConfig, InlayKind},
+    inlay_hints::{InlayHint, InlayHintsConfig, InlayKind, LifetimeElisionHints},
     join_lines::JoinLinesConfig,
     markup::Markup,
     moniker::{MonikerKind, MonikerResult, PackageInformation},
@@ -91,6 +90,7 @@ pub use crate::{
     references::ReferenceSearchResult,
     rename::RenameError,
     runnables::{Runnable, RunnableKind, TestId},
+    signature_help::SignatureHelp,
     static_index::{StaticIndex, StaticIndexedFile, TokenId, TokenStaticData},
     syntax_highlighting::{
         tags::{Highlight, HlMod, HlMods, HlOperator, HlPunct, HlTag},
@@ -231,6 +231,7 @@ impl Analysis {
             cfg_options,
             Env::default(),
             Default::default(),
+            false,
             Default::default(),
         );
         change.change_file(file_id, Some(Arc::new(text)));
@@ -358,8 +359,9 @@ impl Analysis {
         &self,
         config: &InlayHintsConfig,
         file_id: FileId,
+        range: Option<FileRange>,
     ) -> Cancellable<Vec<InlayHint>> {
-        self.with_db(|db| inlay_hints::inlay_hints(db, file_id, config))
+        self.with_db(|db| inlay_hints::inlay_hints(db, file_id, range, config))
     }
 
     /// Returns the set of folding ranges.
@@ -448,9 +450,9 @@ impl Analysis {
         self.with_db(|db| doc_links::external_docs(db, &position))
     }
 
-    /// Computes parameter information for the given call expression.
-    pub fn call_info(&self, position: FilePosition) -> Cancellable<Option<CallInfo>> {
-        self.with_db(|db| call_info::call_info(db, position))
+    /// Computes parameter information at the given position.
+    pub fn signature_help(&self, position: FilePosition) -> Cancellable<Option<SignatureHelp>> {
+        self.with_db(|db| signature_help::signature_help(db, position))
     }
 
     /// Computes call hierarchy candidates for the given file position.
